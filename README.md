@@ -13,7 +13,7 @@ LLAMA_CLOUD_API_KEY=your_real_key_here
 Install dependencies:
 
 ```bash
-cd /Users/amanjain/Desktop/voucher/voucher-creator
+cd voucher-creator
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
