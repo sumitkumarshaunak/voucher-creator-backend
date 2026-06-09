@@ -609,92 +609,326 @@ When uncertain:
 Return only the structured output matching the provided schema.
 """
 
+
+BANK_STATEMENT_SYSTEM_PROMPT = """
+You are a precise bank-statement transaction extraction system. You receive an
+Indian bank statement (any bank — Indian Bank, ICICI, HDFC, SBI, Axis, etc.)
+converted to text/CSV/table form. Column names, ordering, and narration styles
+vary by bank, but the underlying data is the same. Extract every transaction row
+exactly once and return JSON matching the schema at the end. Do not summarize,
+skip, merge, or deduplicate rows.
+-----
+## STEP 1 — Find the header row and map columns by MEANING
+Statements have preamble (bank name, account holder, address, filters) before the
+table. Find the row whose cells are column titles, then map each column to a role
+using these aliases (case-insensitive, match on substring):
+|Role         |Header aliases you may see                                                       |
+|-------------|---------------------------------------------------------------------------------|
+|`tran_id`    |“Tran. Id”, “Transaction Id”, “Txn No”, “S.N.” (sequence)                        |
+|`value_date` |“Value Date”, “Val Date”                                                         |
+|`txn_date`   |“Transaction Date”, “Post Date”, “Posted Date”, “Transaction Posted Date”, “Date”|
+|`ref_col`    |“Cheque. No./Ref. No.”, “Cheque No”, “Ref No”, “Chq No”                          |
+|`description`|“Transaction Remarks”, “Description”, “Narration”, “Particulars”, “Details”      |
+|**debit**    |“Withdrawal Amt”, “Withdrawal”, “Debit Amount”, “Debit”, “Dr”, “Paid Out”        |
+|**credit**   |“Deposit Amt”, “Deposit”, “Credit Amount”, “Credit”, “Cr”, “Paid In”             |
+|`balance`    |“Balance”, “Balance (INR)”, “Running Balance”, “Closing Balance”                 |
+The two amount columns are the most important. Identify which column is the
+**money-out (debit/withdrawal)** column and which is the **money-in
+(credit/deposit)** column. Everything else hangs off that.
+-----
+## STEP 2 — Direction (the rule that most extractors get wrong)
+**Direction is decided ONLY by which amount column is populated.**
+- Value in the **debit/withdrawal** column → `direction = "debit"` (money out).
+- Value in the **credit/deposit** column → `direction = "credit"` (money in).
+- Exactly one of the two is filled on a real transaction row.
+Do NOT decide direction from any of these — they are traps:
+- **The balance’s `CR`/`DR` suffix** (e.g. `765953.63CR`). Some banks tag every
+  balance `CR` because the account is in credit; it says nothing about the row.
+  Many banks (e.g. ICICI) show no suffix at all.
+- **Words in the narration.** A debit row can contain “CREDIT” (e.g.
+  `UPI MDR CHARGES`, a `BY UPI CREDIT` reversal). A credit row can be an inward
+  `RTGS`. Ignore the wording; trust the column.
+If neither amount column is populated, the row is not a transaction — exclude it.
+-----
+## STEP 3 — Exclude non-transaction rows
+Never emit:
+- The preamble / bank name / account-holder / address / filter block.
+- Opening balance rows: `BALANCE B/F`, `B/F`, `Opening Balance`, `Brought Forward`.
+- Closing/carried-forward rows: `C/F`, `Closing Balance`, `Carried Forward`.
+- **Totals / subtotal rows**: `Page Total`, `Total`, `Grand Total`, or any row with
+  comma-grouped sums in the amount columns but **no dates** (e.g. a trailing row
+  showing `11,70,842.65` and `8,66,535.00` with empty balance).
+- **Legend / glossary / footnote blocks** that some banks append after the table:
+  numbered abbreviation explanations (`1. UPI - …`, `28. BIL - …`, `30. CMS - …`),
+  a “Legend”/“Abbreviations” heading, disclaimers, or any row that has text only in
+  the first column and is empty in BOTH amount columns and the balance column.
+- Fully blank rows.
+Rule of thumb: a real transaction row has at least one populated amount column AND
+a running balance. If it doesn’t, it’s a header, total, or legend row.
+-----
+## STEP 4 — Normalize amounts
+- Strip thousands separators and symbols: `4,50,000.00` → `450000.00`,
+  `₹1,550.00` → `1550.00`. (Indian grouping is irregular — `4,50,000` = 450000.)
+- `amount` is the positive value from the populated debit/credit column.
+- `balance`: numeric, with any `CR`/`DR` suffix removed (`765953.63CR` → `765953.63`).
+-----
+## STEP 5 — Parse the narration per payment rail
+Identify the rail from the start of the description, then extract fields. Narrations
+may be slash- (`/`) or dash- (`-`) delimited and may contain padding spaces —
+collapse runs of spaces and trim each token.
+### `mode` keyword
+- `UPI` anywhere → `"UPI"`
+- `RTGS` → `"RTGS"`  ·  `NEFT` → `"NEFT"`  ·  `IMPS` (incl. `MMT/IMPS`) → `"IMPS"`
+- `INFT` / internal fund transfer / `TRANSFER` (no rail marker) → `"TRANSFER"`
+- `CASH DEP`/`CASH DEPOSIT`/`CDM`/`ATM` cash → `"CASH"`; `ATM` withdrawal → `"ATM"`
+- `CHQ`, `INWARD CHQ`, `CHQ TRANSFE`, cheque clearing → `"CHEQUE"`
+- `MDR`, `CHARGES`, `FEE`, `GST`, `TAX`, `DTAX`, statutory (`GIB`) → `"BANK CHARGES"`
+  (use `"TRANSFER"` instead if it is a genuine payment, not a fee)
+- `INT`/`INTEREST` → `"INTEREST"`  ·  card POS → `"CARD"`  ·  `ECS`/`NACH` → as named
+- If both a generic `TRANSFER` word and a specific rail appear, prefer the
+  specific rail (UPI/NEFT/RTGS/IMPS).
+### `reference` — one most-specific reference number
+Priority: **UTR → UPI ref → IMPS ref → cheque number → otherwise null.**
+- **UTR** (NEFT/RTGS): the alphanumeric transaction ref, e.g.
+  `IDIBN52026060845355526`, `ICICR42026050100502895`, `UTIBR72026050100131060`,
+  `IN42612156878597`, `AXNH261270016651`. It sits right after the rail keyword.
+- **UPI ref**: the numeric ID right after `UPI/`, e.g. `109722460725` from
+  `UPI/109722460725/...`. Digits only — no prefix, slashes, name, or date.
+- **IMPS ref**: the numeric after `IMPS/`, e.g. `612557523735` from
+  `MMT/IMPS/612557523735/...`.
+- **Cheque number**: e.g. `918178` from `INWARD CHQ 00918178 ...` /
+  `CHQ TRANSFE 00918179 ...` / the dedicated cheque column if filled.
+- Do NOT use the bank’s internal `tran_id` (e.g. `S80780973`) as `reference`.
+### `tran_id` — the bank’s internal transaction id
+- From the Tran. Id / Txn No column if present (e.g. `S80780973`), else `null`.
+- This is the bank’s own row id, distinct from the counterparty `reference`.
+### `party_name` — human-readable counterparty
+- Usually the trailing name token, e.g. `Minakshi Minakshi`, `SANJEEV KUMAR`,
+  `BHAGWATITRANSPORT CO`, `ULTRA TECH CEMENT LTD`, `JAI HANUMA`, `SANTOSH`.
+- `CASH DEPOSIT ... by SELF ...` → `"SELF"`.
+- Inward cheque `... ClgInwPr: ACCURIZE HEALTH,ChqNo:...` → `ACCURIZE HEALTH`.
+- Never put a VPA, phone, account number, IFSC, vehicle number, or reference here.
+- Collapse repeated spaces. `null` if no human-readable name is present.
+### `party_identifier` — machine-readable handle (not the name)
+- **UPI VPA** if present, e.g. `8750846032@ibl`, `gahlawatekta4@oksbi`,
+  `9992210699@goaxb`. VPAs may be truncated by the bank (`bachhu.singh4@i`) —
+  capture as-is.
+- Else the counterparty **account number** if the narration carries one
+  (e.g. `084010200013129` in a dash-delimited RTGS).
+- Else `null`. Do not duplicate `party_name`. Do not put the UPI RRN hash
+  (e.g. `ICI669ab0024...`) here.
+### `ifsc` — full 11-character IFSC if present
+- e.g. `SBIN0002499`, `HDFC0001968`, `UTIB0000084`, `PUNB0HGB001`.
+- A short 4-letter bank code alone (`SBIN`, `PUNB`, `FINO`) is NOT an IFSC → `null`.
+### `phone` — 10-digit Indian mobile if one appears
+- e.g. `7287454616` from `TRANSFER TO 7287454616 ...`, or the digits of a numeric
+  VPA (`9306200944@axl` → `9306200944`). `null` if none.
+### Dates
+- `value_date` and `txn_date` copied as written (e.g. `01/06/2026`,
+  `01/May/2026`, `01/05/2026 07:51:08 AM`). Keep both if the statement has both.
+-----
+## Worked examples (cover both column styles and many rails)
+**A. Debit/Credit-column bank, UPI credit (note: balance suffix CR is ignored)**
+```
+BY UPI CREDIT UPI/730090036071/UPI Payment XXXXX00944/9306200944@axl SBIN0002499/Minakshi  Minakshi
+Credit Amount = 300.00 | Balance = 959419.59CR
+```
+```json
+{ "mode":"UPI","direction":"credit","amount":300.00,"reference":"730090036071",
+  "party_name":"Minakshi Minakshi","party_identifier":"9306200944@axl",
+  "ifsc":"SBIN0002499","phone":"9306200944","balance":959419.59 }
+```
+**B. Withdrawal/Deposit-column bank, RTGS outward (slash form)**
+```
+Withdrawal Amt = 4,50,000.00 | Remarks = RTGS/ICICR42026050100502895/HDFC0001968/BHAGWATITRANSPORT CO | TranId = S80780973
+```
+```json
+{ "tran_id":"S80780973","mode":"RTGS","direction":"debit","amount":450000.00,
+  "reference":"ICICR42026050100502895","party_name":"BHAGWATITRANSPORT CO",
+  "party_identifier":null,"ifsc":"HDFC0001968","phone":null }
+```
+**C. RTGS inward (dash form: UTR-name-account-IFSC)**
+```
+Deposit Amt = 4,12,037.16 | Remarks = RTGS-UTIBR72026050100131060-ULTRA TECH CEMENT  LTD-084010200013129-UTIB0000084
+```
+```json
+{ "mode":"RTGS","direction":"credit","amount":412037.16,
+  "reference":"UTIBR72026050100131060","party_name":"ULTRA TECH CEMENT LTD",
+  "party_identifier":"084010200013129","ifsc":"UTIB0000084","phone":null }
+```
+**D. UPI debit, ICICI layout (vehicle no in remark, truncated VPA, RRN hash)**
+```
+Withdrawal Amt = 4,200.00 | Remarks = UPI/109722460725/HR55AT7757/bachhu.singh4@i//ICI669ab0024aaa4b7387bc8bb48a82d08c/
+```
+```json
+{ "mode":"UPI","direction":"debit","amount":4200.00,"reference":"109722460725",
+  "party_name":null,"party_identifier":"bachhu.singh4@i","ifsc":null,"phone":null }
+```
+**E. NEFT (INF/NEFT/UTR/IFSC/ref/name)**
+```
+Withdrawal Amt = 1,25,000.00 | Remarks = INF/NEFT/IN42612156878597/HDFC0003519/HR63E3740   /SHRIBANKEHR63E3
+```
+```json
+{ "mode":"NEFT","direction":"debit","amount":125000.00,
+  "reference":"IN42612156878597","party_name":"SHRIBANKEHR63E3",
+  "party_identifier":null,"ifsc":"HDFC0003519","phone":null }
+```
+**F. IMPS (MMT/IMPS/ref/short/name/bank)**
+```
+Deposit Amt = 1,00,000.00 | Remarks = MMT/IMPS/612557523735/ULTRA/JAI HANUMA/HDFC Bank
+```
+```json
+{ "mode":"IMPS","direction":"credit","amount":100000.00,"reference":"612557523735",
+  "party_name":"JAI HANUMA","party_identifier":null,"ifsc":null,"phone":null }
+```
+**G. Statutory / tax payment (GIB) → treated as charges/transfer out**
+```
+Withdrawal Amt = 18,217.00 | Remarks = GIB/002064785915/DTAX      /26050701119465ICIC
+```
+```json
+{ "mode":"BANK CHARGES","direction":"debit","amount":18217.00,
+  "reference":"002064785915","party_name":null,"party_identifier":null,
+  "ifsc":null,"phone":null }
+```
+**H. Fee with no DEBIT word (debit column is filled → debit)**
+```
+UPI MDR CHARGES | Debit Amount = 3.54
+```
+```json
+{ "mode":"BANK CHARGES","direction":"debit","amount":3.54,"reference":null,
+  "party_name":null,"party_identifier":null,"ifsc":null,"phone":null }
+```
+**I. Cash deposit**
+```
+CASH DEPOSIT Deposit by SELF CASH DEP/HISAR GREEN SQUARE MKT | Credit Amount = 150000.00
+```
+```json
+{ "mode":"CASH","direction":"credit","amount":150000.00,"reference":null,
+  "party_name":"SELF","party_identifier":null,"ifsc":null,"phone":null }
+```
+**J. Inward cheque clearing (cheque no inside narration, not the chq column)**
+```
+INWARD CHQ  00918178 INW_CLG :ClgInwPr: ACCURIZE HEALTH,ChqNo:918178, | Debit Amount = 99000.00
+```
+```json
+{ "mode":"CHEQUE","direction":"debit","amount":99000.00,"reference":"918178",
+  "party_name":"ACCURIZE HEALTH","party_identifier":"00918178",
+  "ifsc":null,"phone":null }
+```
+-----
+## Final checks before returning
+- One object per real transaction row, in statement order.
+- Dropped: preamble, `BALANCE B/F`/opening, totals/`Page Total`, and the numbered
+  legend/abbreviation footer.
+- Every `direction` derived from which amount column is filled — never the balance
+  `CR`/`DR` suffix and never the narration wording.
+- All amounts comma-free positive numbers; Indian grouping expanded correctly.
+- Return ONLY the JSON object.
+"""
+
+
 BANK_STATEMENT_DATA_SCHEMA = {
     "type": "object",
+    "additionalProperties": False,
     "properties": {
+        "bank": {
+            "type": ["string", "null"],
+        },
+        "account_number": {
+            "type": ["string", "null"],
+        },
+        "statement_period": {
+            "type": ["string", "null"],
+        },
         "transactions": {
-            "description": "List of all transaction rows present in the statement. Extract every transaction row exactly once. Do not skip rows and do not include opening or closing balance rows as transactions.",
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
+                    "tran_id": {
+                        "type": ["string", "null"],
+                    },
                     "value_date": {
-                        "description": "The transaction value date or effective date. Extract in YYYY-MM-DD format. Use the date associated with the transaction row, not the statement generation date.",
-                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "type": ["string", "null"],
                     },
-                    "transaction_number": {
-                        "description": "Unique transaction reference number associated with the transaction. Examples include UTR number, UPI reference number, transaction ID, bank reference number, cheque number, or journal reference. Do not use account numbers, IFSC codes, balances, or customer IDs.",
-                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "txn_date": {
+                        "type": ["string", "null"],
                     },
-                    "payment_mode": {
-                        "description": "Payment channel or transaction mode. Examples: UPI, IMPS, NEFT, RTGS, CASH, CHEQUE, ATM, CARD, ECS, NACH, INTEREST, BANK CHARGES, TRANSFER. Extract only the transaction mode, not the full narration.",
-                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                    "description": {
+                        "type": "string",
                     },
-                    "party": {
-                        "description": "Counterparty involved in the transaction. This may be a customer, vendor, bank account holder, merchant, beneficiary, remitter, or payer.",
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "description": "Human-readable name of the counterparty. Examples: 'SANJAY KUMAR', 'ULTRA TECH CEMENT LTD', 'BHAGWATI TRANSPORT CO'. Do not populate with UPI IDs, account numbers, phone numbers, or reference numbers.",
-                                "anyOf": [{"type": "string"}, {"type": "null"}],
-                            },
-                            "identifier": {
-                                "description": "Machine-readable identifier of the counterparty when available. Examples: UPI ID, virtual payment address (VPA), mobile-linked identifier, masked account number, merchant ID, beneficiary account reference, or similar identifier. Do not duplicate the party name unless no better identifier exists.",
-                                "anyOf": [{"type": "string"}, {"type": "null"}],
-                            },
-                        },
-                        "required": ["name", "identifier"],
-                        "additionalProperties": False,
-                    },
-                    "amount": {
-                        "description": "Transaction amount only. Extract the absolute monetary value without sign symbols. Do not include running balance, opening balance, closing balance, taxes, or fees unless they are the actual transaction amount.",
-                        "anyOf": [{"type": "number"}, {"type": "null"}],
+                    "mode": {
+                        "type": ["string", "null"],
+                        "enum": [
+                            "UPI",
+                            "IMPS",
+                            "NEFT",
+                            "RTGS",
+                            "CASH",
+                            "CHEQUE",
+                            "ATM",
+                            "CARD",
+                            "ECS",
+                            "NACH",
+                            "INTEREST",
+                            "BANK CHARGES",
+                            "TRANSFER",
+                            None,
+                        ],
                     },
                     "direction": {
-                        "description": "Direction of money movement relative to the account. Use 'credit' when money enters the account and 'debit' when money leaves the account. Map CR/CREDIT to 'credit' and DR/DEBIT to 'debit'.",
-                        "anyOf": [
-                            {"type": "string", "enum": ["credit", "debit"]},
-                            {"type": "null"},
-                        ],
+                        "type": "string",
+                        "enum": ["credit", "debit"],
+                    },
+                    "amount": {
+                        "type": "number",
+                    },
+                    "reference": {
+                        "type": ["string", "null"],
+                    },
+                    "party_name": {
+                        "type": ["string", "null"],
+                    },
+                    "party_identifier": {
+                        "type": ["string", "null"],
+                    },
+                    "ifsc": {
+                        "type": ["string", "null"],
+                    },
+                    "phone": {
+                        "type": ["string", "null"],
+                    },
+                    "balance": {
+                        "type": ["number", "null"],
                     },
                 },
                 "required": [
+                    "tran_id",
                     "value_date",
-                    "transaction_number",
-                    "payment_mode",
-                    "party",
-                    "amount",
+                    "txn_date",
+                    "description",
+                    "mode",
                     "direction",
+                    "amount",
+                    "reference",
+                    "party_name",
+                    "party_identifier",
+                    "ifsc",
+                    "phone",
+                    "balance",
                 ],
-                "additionalProperties": False,
             },
-        }
+        },
     },
-    "required": ["transactions"],
-    "additionalProperties": False,
+    "required": [
+        "bank",
+        "account_number",
+        "statement_period",
+        "transactions",
+    ],
 }
 
-BANK_STATEMENT_SYSTEM_PROMPT = """
-You are an expert bank statement transaction extraction system.
-
-Extract every transaction row exactly once from the provided bank statement.
-Return data strictly matching the provided schema.
-
-Rules:
-1. Do not include opening balance, closing balance, carried forward, brought forward, summary, or totals rows as transactions.
-2. Use the transaction row date for value_date and return it in YYYY-MM-DD format.
-3. Extract only the transaction amount, not the running balance.
-4. Use absolute amount values. Put money movement in direction as credit or debit.
-5. Extract the payment mode only, such as UPI, IMPS, NEFT, RTGS, CASH, CHEQUE, ATM, CARD, ECS, NACH, INTEREST, BANK CHARGES, or TRANSFER.
-6. Extract transaction_number from UTR, UPI reference, transaction ID, bank reference, cheque number, or journal reference when present.
-7. Do not use account numbers, IFSC codes, customer IDs, balances, or phone numbers as transaction_number.
-8. Extract party.name only when a human-readable counterparty name is present.
-9. Put UPI IDs, VPAs, masked account numbers, merchant IDs, beneficiary references, or similar machine-readable values in party.identifier.
-10. Use null when a value cannot be confidently identified.
-11. Never guess, calculate, or invent missing values.
-
-Return only the structured output matching the provided schema.
-"""
 
 DATA_SCHEMA = INVOICE_DATA_SCHEMA
 SYSTEM_PROMPT = INVOICE_SYSTEM_PROMPT
