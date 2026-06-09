@@ -1,5 +1,8 @@
 import argparse
 import json
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from config import load_backend_env
@@ -19,6 +22,9 @@ EXCEL_ROWS_PER_BATCH = 100
 PDF_PAGES_PER_BATCH = 5
 SUPPORTED_DOCUMENT_TYPES = {"bank_statement"}
 BANK_STATEMENT_MODEL = "gpt-4o"
+BANK_STATEMENT_BATCH_WORKERS = int(os.environ.get("BANK_STATEMENT_BATCH_WORKERS", "4"))
+BANK_STATEMENT_LLM_RETRIES = 2
+BANK_STATEMENT_RETRY_BACKOFF_SECONDS = 1
 
 
 def infer_document_type(file_path):
@@ -43,9 +49,49 @@ def _merge_results(batch_results):
     return merged
 
 
+def _call_with_retry(batch_label, callback):
+    for attempt in range(BANK_STATEMENT_LLM_RETRIES + 1):
+        try:
+            return callback()
+        except Exception as error:
+            if attempt >= BANK_STATEMENT_LLM_RETRIES:
+                print(
+                    "bank statement LLM failed:",
+                    f"batch={batch_label}",
+                    f"attempts={attempt + 1}",
+                    f"error={error}",
+                    flush=True,
+                )
+                raise
+
+            print(
+                "bank statement LLM retry:",
+                f"batch={batch_label}",
+                f"retry={attempt + 1}/{BANK_STATEMENT_LLM_RETRIES}",
+                f"error={error}",
+                flush=True,
+            )
+            time.sleep(BANK_STATEMENT_RETRY_BACKOFF_SECONDS * (attempt + 1))
+
+
+def _run_batches_in_parallel(batch_jobs):
+    results = [None] * len(batch_jobs)
+    max_workers = max(1, min(BANK_STATEMENT_BATCH_WORKERS, len(batch_jobs)))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_call_with_retry, batch_label, callback): index
+            for index, batch_label, callback in batch_jobs
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+
+    return results
+
+
 def _extract_batch(client, system_prompt, batch_label, content, header_context=None):
     header_text = f"\nColumn header context:\n{header_context}\n" if header_context else ""
-    result = call_llm(
+    return call_llm(
         model=BANK_STATEMENT_MODEL,
         instructions=system_prompt,
         input_content=(
@@ -58,7 +104,6 @@ def _extract_batch(client, system_prompt, batch_label, content, header_context=N
         client=client,
         error_context=f"extracting bank statement batch {batch_label}",
     )
-    return result
 
 
 def _extract_excel_file(client, system_prompt, file_path):
@@ -66,47 +111,62 @@ def _extract_excel_file(client, system_prompt, file_path):
     if not batches:
         raise RuntimeError("Could not read any rows from the spreadsheet.")
 
-    return _merge_results(
-        _extract_batch(
-            client,
-            system_prompt,
+    batch_jobs = [
+        (
+            index,
             batch["label"],
-            batch["content"],
-            header_context=batch["header_context"],
+            lambda batch=batch: _extract_batch(
+                client,
+                system_prompt,
+                batch["label"],
+                batch["content"],
+                header_context=batch["header_context"],
+            ),
         )
-        for batch in batches
-    )
+        for index, batch in enumerate(batches)
+    ]
+
+    return _merge_results(_run_batches_in_parallel(batch_jobs))
 
 
 def _extract_pdf_file(client, system_prompt, file_path):
     batch_results = []
     temp_files = []
     try:
-        for batch_label, batch_file in pdf_page_batches(file_path, pages_per_batch=PDF_PAGES_PER_BATCH):
-            temp_files.append(batch_file)
-            result = call_llm(
-                model=BANK_STATEMENT_MODEL,
-                instructions=system_prompt,
-                input_content=[
-                    {
-                        "type": "input_file",
-                        "filename": f"{file_path.stem}-{batch_label}.pdf",
-                        "file_data": file_data_uri(batch_file),
-                    },
-                    {
-                        "type": "input_text",
-                        "text": (
-                            f"This PDF batch contains bank statement {batch_label}. "
-                            "Extract only transaction rows from these pages. "
-                            "Ignore opening balance, closing balance, summaries, legends, and totals. "
-                            "Return only JSON."
-                        ),
-                    },
-                ],
-                client=client,
-                error_context=f"extracting bank statement PDF {batch_label}",
+        pdf_batches = pdf_page_batches(file_path, pages_per_batch=PDF_PAGES_PER_BATCH)
+        temp_files.extend(batch_file for _, batch_file in pdf_batches)
+        batch_jobs = []
+        for index, (batch_label, batch_file) in enumerate(pdf_batches):
+            batch_jobs.append(
+                (
+                    index,
+                    batch_label,
+                    lambda batch_label=batch_label, batch_file=batch_file: call_llm(
+                        model=BANK_STATEMENT_MODEL,
+                        instructions=system_prompt,
+                        input_content=[
+                            {
+                                "type": "input_file",
+                                "filename": f"{file_path.stem}-{batch_label}.pdf",
+                                "file_data": file_data_uri(batch_file),
+                            },
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    f"This PDF batch contains bank statement {batch_label}. "
+                                    "Extract only transaction rows from these pages. "
+                                    "Ignore opening balance, closing balance, summaries, legends, and totals. "
+                                    "Return only JSON."
+                                ),
+                            },
+                        ],
+                        client=client,
+                        error_context=f"extracting bank statement PDF {batch_label}",
+                    ),
+                )
             )
-            batch_results.append(result)
+
+        batch_results = _run_batches_in_parallel(batch_jobs)
     finally:
         for temp_file in temp_files:
             temp_file.unlink(missing_ok=True)
