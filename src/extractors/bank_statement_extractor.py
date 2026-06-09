@@ -3,8 +3,7 @@ import json
 from pathlib import Path
 
 from config import load_backend_env
-from prompts.bank_statement_prompt import BANK_STATEMENT_SYSTEM_PROMPT
-from schemas.bank_statement_schema import BANK_STATEMENT_DATA_SCHEMA
+from prompts import BANK_STATEMENT_DATA_SCHEMA, BANK_STATEMENT_SYSTEM_PROMPT
 from services.llm_service import build_json_instructions, call_llm, get_openai_client
 from utils.files import file_data_uri
 from utils.pdf import pdf_page_batches

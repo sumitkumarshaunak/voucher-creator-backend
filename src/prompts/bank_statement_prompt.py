@@ -1,3 +1,0 @@
-from .legacy import BANK_STATEMENT_SYSTEM_PROMPT
-
-__all__ = ["BANK_STATEMENT_SYSTEM_PROMPT"]

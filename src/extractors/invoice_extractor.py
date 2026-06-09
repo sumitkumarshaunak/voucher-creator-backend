@@ -4,8 +4,7 @@ import os
 from pathlib import Path
 
 from config import load_backend_env
-from prompts.invoice_prompt import INVOICE_SYSTEM_PROMPT
-from schemas.invoice_schema import INVOICE_DATA_SCHEMA
+from prompts import INVOICE_DATA_SCHEMA, INVOICE_SYSTEM_PROMPT
 from services.llama_parse_service import parse_document
 from services.llm_service import build_json_instructions, call_llm
 

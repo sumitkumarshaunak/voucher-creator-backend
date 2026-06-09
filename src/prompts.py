@@ -707,7 +707,7 @@ Priority: **UTR → UPI ref → IMPS ref → cheque number → otherwise null.**
   `BHAGWATITRANSPORT CO`, `ULTRA TECH CEMENT LTD`, `JAI HANUMA`, `SANTOSH`.
 - `CASH DEPOSIT ... by SELF ...` → `"SELF"`.
 - Inward cheque `... ClgInwPr: ACCURIZE HEALTH,ChqNo:...` → `ACCURIZE HEALTH`.
-- Never put a VPA, phone, account number, IFSC, vehicle number, or reference here.
+- Never put a VPA, mobile number, account number, IFSC, vehicle number, or reference here.
 - Collapse repeated spaces. `null` if no human-readable name is present.
 ### `party_identifier` — machine-readable handle (not the name)
 - **UPI VPA** if present, e.g. `8750846032@ibl`, `gahlawatekta4@oksbi`,
@@ -720,9 +720,6 @@ Priority: **UTR → UPI ref → IMPS ref → cheque number → otherwise null.**
 ### `ifsc` — full 11-character IFSC if present
 - e.g. `SBIN0002499`, `HDFC0001968`, `UTIB0000084`, `PUNB0HGB001`.
 - A short 4-letter bank code alone (`SBIN`, `PUNB`, `FINO`) is NOT an IFSC → `null`.
-### `phone` — 10-digit Indian mobile if one appears
-- e.g. `7287454616` from `TRANSFER TO 7287454616 ...`, or the digits of a numeric
-  VPA (`9306200944@axl` → `9306200944`). `null` if none.
 ### Dates
 - `value_date` and `txn_date` copied as written (e.g. `01/06/2026`,
   `01/May/2026`, `01/05/2026 07:51:08 AM`). Keep both if the statement has both.
@@ -736,7 +733,7 @@ Credit Amount = 300.00 | Balance = 959419.59CR
 ```json
 { "mode":"UPI","direction":"credit","amount":300.00,"reference":"730090036071",
   "party_name":"Minakshi Minakshi","party_identifier":"9306200944@axl",
-  "ifsc":"SBIN0002499","phone":"9306200944","balance":959419.59 }
+  "ifsc":"SBIN0002499","balance":959419.59 }
 ```
 **B. Withdrawal/Deposit-column bank, RTGS outward (slash form)**
 ```
@@ -745,7 +742,7 @@ Withdrawal Amt = 4,50,000.00 | Remarks = RTGS/ICICR42026050100502895/HDFC0001968
 ```json
 { "tran_id":"S80780973","mode":"RTGS","direction":"debit","amount":450000.00,
   "reference":"ICICR42026050100502895","party_name":"BHAGWATITRANSPORT CO",
-  "party_identifier":null,"ifsc":"HDFC0001968","phone":null }
+  "party_identifier":null,"ifsc":"HDFC0001968" }
 ```
 **C. RTGS inward (dash form: UTR-name-account-IFSC)**
 ```
@@ -754,7 +751,7 @@ Deposit Amt = 4,12,037.16 | Remarks = RTGS-UTIBR72026050100131060-ULTRA TECH CEM
 ```json
 { "mode":"RTGS","direction":"credit","amount":412037.16,
   "reference":"UTIBR72026050100131060","party_name":"ULTRA TECH CEMENT LTD",
-  "party_identifier":"084010200013129","ifsc":"UTIB0000084","phone":null }
+  "party_identifier":"084010200013129","ifsc":"UTIB0000084" }
 ```
 **D. UPI debit, ICICI layout (vehicle no in remark, truncated VPA, RRN hash)**
 ```
@@ -762,7 +759,7 @@ Withdrawal Amt = 4,200.00 | Remarks = UPI/109722460725/HR55AT7757/bachhu.singh4@
 ```
 ```json
 { "mode":"UPI","direction":"debit","amount":4200.00,"reference":"109722460725",
-  "party_name":null,"party_identifier":"bachhu.singh4@i","ifsc":null,"phone":null }
+  "party_name":null,"party_identifier":"bachhu.singh4@i","ifsc":null }
 ```
 **E. NEFT (INF/NEFT/UTR/IFSC/ref/name)**
 ```
@@ -771,7 +768,7 @@ Withdrawal Amt = 1,25,000.00 | Remarks = INF/NEFT/IN42612156878597/HDFC0003519/H
 ```json
 { "mode":"NEFT","direction":"debit","amount":125000.00,
   "reference":"IN42612156878597","party_name":"SHRIBANKEHR63E3",
-  "party_identifier":null,"ifsc":"HDFC0003519","phone":null }
+  "party_identifier":null,"ifsc":"HDFC0003519" }
 ```
 **F. IMPS (MMT/IMPS/ref/short/name/bank)**
 ```
@@ -779,7 +776,7 @@ Deposit Amt = 1,00,000.00 | Remarks = MMT/IMPS/612557523735/ULTRA/JAI HANUMA/HDF
 ```
 ```json
 { "mode":"IMPS","direction":"credit","amount":100000.00,"reference":"612557523735",
-  "party_name":"JAI HANUMA","party_identifier":null,"ifsc":null,"phone":null }
+  "party_name":"JAI HANUMA","party_identifier":null,"ifsc":null }
 ```
 **G. Statutory / tax payment (GIB) → treated as charges/transfer out**
 ```
@@ -788,7 +785,7 @@ Withdrawal Amt = 18,217.00 | Remarks = GIB/002064785915/DTAX      /2605070111946
 ```json
 { "mode":"BANK CHARGES","direction":"debit","amount":18217.00,
   "reference":"002064785915","party_name":null,"party_identifier":null,
-  "ifsc":null,"phone":null }
+  "ifsc":null }
 ```
 **H. Fee with no DEBIT word (debit column is filled → debit)**
 ```
@@ -796,7 +793,7 @@ UPI MDR CHARGES | Debit Amount = 3.54
 ```
 ```json
 { "mode":"BANK CHARGES","direction":"debit","amount":3.54,"reference":null,
-  "party_name":null,"party_identifier":null,"ifsc":null,"phone":null }
+  "party_name":null,"party_identifier":null,"ifsc":null }
 ```
 **I. Cash deposit**
 ```
@@ -804,7 +801,7 @@ CASH DEPOSIT Deposit by SELF CASH DEP/HISAR GREEN SQUARE MKT | Credit Amount = 1
 ```
 ```json
 { "mode":"CASH","direction":"credit","amount":150000.00,"reference":null,
-  "party_name":"SELF","party_identifier":null,"ifsc":null,"phone":null }
+  "party_name":"SELF","party_identifier":null,"ifsc":null }
 ```
 **J. Inward cheque clearing (cheque no inside narration, not the chq column)**
 ```
@@ -813,7 +810,7 @@ INWARD CHQ  00918178 INW_CLG :ClgInwPr: ACCURIZE HEALTH,ChqNo:918178, | Debit Am
 ```json
 { "mode":"CHEQUE","direction":"debit","amount":99000.00,"reference":"918178",
   "party_name":"ACCURIZE HEALTH","party_identifier":"00918178",
-  "ifsc":null,"phone":null }
+  "ifsc":null }
 ```
 -----
 ## Final checks before returning
@@ -896,9 +893,6 @@ BANK_STATEMENT_DATA_SCHEMA = {
                     "ifsc": {
                         "type": ["string", "null"],
                     },
-                    "phone": {
-                        "type": ["string", "null"],
-                    },
                     "balance": {
                         "type": ["number", "null"],
                     },
@@ -915,7 +909,6 @@ BANK_STATEMENT_DATA_SCHEMA = {
                     "party_name",
                     "party_identifier",
                     "ifsc",
-                    "phone",
                     "balance",
                 ],
             },
