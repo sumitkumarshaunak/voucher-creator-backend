@@ -232,7 +232,7 @@ INVOICE_DATA_SCHEMA={
             }
         },
         "additional_items": {
-            "description": "Invoice-level taxes, discounts, insurance, round-off, and other charges not including the freight or transportation cost.",
+            "description": "Invoice-level charges such as taxes, discounts, insurance, packing, and round-off. Excludes freight and transportation cost. Round-off must use line_type 'round_off' and must never be classified as 'other'.",
             "type": "array",
             "items": {
                 "description": "Monetary line associated with an item or the invoice.",
@@ -315,7 +315,7 @@ INVOICE_DATA_SCHEMA={
                     }]
                 },
                 "other_charges": {
-                    "description": "Other charges excluding taxes and transportation cost included in the invoice total.",
+                    "description": "Other charges included in the invoice total, excluding taxes, transportation cost, and round-off. Examples: insurance, packing charges, loading/unloading charges.",
                     "anyOf": [{
                         "type": "number"
                     }, {
@@ -540,6 +540,16 @@ Use null instead.
 ---
 
 # Totals Rules
+
+Extract totals only from summary sections.
+
+CRITICAL: Round-off must ALWAYS go into round_off_amount only.
+Never place round-off in other_charges under any circumstances.
+Round-off is identifiable as small adjustment values (positive or negative)
+used to make the invoice total a round number.
+
+other_charges includes ONLY: insurance, packing, loading,
+unloading, handling — never taxes, never round-off.
 
 Extract totals only from summary sections.
 

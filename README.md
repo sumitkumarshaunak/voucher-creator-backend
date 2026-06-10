@@ -43,3 +43,24 @@ Expected response:
 ```
 
 The frontend is configured to call `http://127.0.0.1:8000`.
+
+## Tally Posting
+
+Keep Tally running with HTTP access on port `9000`, then use the frontend's
+`Post to Tally` button after parsing and reviewing a voucher.
+
+The backend posts Tally XML to:
+
+```env
+TALLY_URL=http://127.0.0.1:9000
+```
+
+Voucher mapping:
+
+- Bank statement credit rows become Receipt vouchers.
+- Bank statement debit rows become Payment vouchers.
+- Sales invoice uploads become Sales vouchers.
+- Purchase invoice uploads become Purchase vouchers.
+
+The first version expects the target ledgers to already exist in Tally. Configure
+ledger names in `.env` using the keys shown in `.env.example`.
