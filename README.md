@@ -59,8 +59,17 @@ Voucher mapping:
 
 - Bank statement credit rows become Receipt vouchers.
 - Bank statement debit rows become Payment vouchers.
+- Cash deposit/movement credit rows become Payment vouchers so Cash is credited
+  and the bank ledger is debited.
 - Sales invoice uploads become Sales vouchers.
 - Purchase invoice uploads become Purchase vouchers.
+
+Bank statement voucher numbers are generated from bank, account number, value
+date, reference, direction, and amount. Before posting, the backend checks Tally
+for the same voucher type and voucher number, then skips already-posted entries.
+Tally lookup/export calls are batched with `TALLY_LOOKUP_BATCH_SIZE`, missing
+master creation uses `TALLY_MASTER_BATCH_SIZE`, and voucher imports are sent in
+batches controlled by `TALLY_VOUCHER_BATCH_SIZE`.
 
 The first version expects the target ledgers to already exist in Tally. Configure
 ledger names in `.env` using the keys shown in `.env.example`.

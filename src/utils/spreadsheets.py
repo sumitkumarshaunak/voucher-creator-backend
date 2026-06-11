@@ -109,12 +109,17 @@ def _openpyxl_rows(file_path):
     import openpyxl
 
     rows_by_sheet = []
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="Workbook contains no default style.*")
-        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        rows_by_sheet.append((sheet_name, [list(row) for row in ws.iter_rows(values_only=True)]))
+    wb = None
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Workbook contains no default style.*")
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows_by_sheet.append((sheet_name, [list(row) for row in ws.iter_rows(values_only=True)]))
+    finally:
+        if wb is not None:
+            wb.close()
     return rows_by_sheet
 
 

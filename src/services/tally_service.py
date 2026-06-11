@@ -1,5 +1,7 @@
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +12,11 @@ from xml.sax.saxutils import escape
 
 
 DEFAULT_TALLY_URL = "http://127.0.0.1:9000"
+DEFAULT_TALLY_TIMEOUT_SECONDS = 30
+DEFAULT_TALLY_VOUCHER_BATCH_SIZE = 25
+DEFAULT_TALLY_LOOKUP_BATCH_SIZE = 25
+DEFAULT_TALLY_MASTER_BATCH_SIZE = 10
+_selected_company = ContextVar("selected_tally_company", default=None)
 
 
 @dataclass
@@ -18,12 +25,34 @@ class LedgerEntry:
     amount: float
     is_debit: bool
     is_party: bool = False
+    is_bank: bool = False
+
+
+@dataclass
+class InventoryEntry:
+    item_name: str
+    ledger_name: str
+    amount: float
+    is_debit: bool
+    quantity: str = ""
+    rate: str = ""
 
 
 def post_to_tally(payload):
     document_type = payload.get("document_type")
     source = payload.get("source")
     data = payload.get("data") or {}
+    company_name = _clean_text(payload.get("company_name"))
+
+    with _tally_company(company_name):
+        return _post_to_tally(document_type, source, data)
+
+
+def list_tally_companies():
+    return {"companies": sorted(_fetch_companies())}
+
+
+def _post_to_tally(document_type, source, data):
 
     if document_type == "bank_statement":
         vouchers = _bank_statement_vouchers(data)
@@ -36,14 +65,29 @@ def post_to_tally(payload):
         raise ValueError("No vouchers found to post to Tally.")
 
     _ensure_tally_company()
-    _ensure_tally_masters(vouchers)
+    unique_vouchers, duplicate_count = _unique_vouchers(vouchers)
+    existing_voucher_keys = _fetch_existing_voucher_keys(unique_vouchers)
+    vouchers_to_post = [
+        voucher
+        for voucher in unique_vouchers
+        if _voucher_key(voucher) not in existing_voucher_keys
+    ]
+    skipped = duplicate_count + len(unique_vouchers) - len(vouchers_to_post)
 
-    tally_xml = _build_envelope(vouchers)
-    response_text = _send_to_tally(tally_xml)
-    response_summary = _parse_tally_response(response_text)
+    if not vouchers_to_post:
+        return {
+            "posted": 0,
+            "skipped": skipped,
+            "tally": _empty_tally_summary(),
+        }
+
+    _ensure_tally_masters(vouchers_to_post)
+
+    response_summary = _post_vouchers_in_batches(vouchers_to_post)
 
     return {
-        "posted": len(vouchers),
+        "posted": len(vouchers_to_post),
+        "skipped": skipped,
         "tally": response_summary,
     }
 
@@ -52,8 +96,107 @@ def _env(name, default):
     return os.environ.get(name, default)
 
 
+@contextmanager
+def _tally_company(company_name):
+    token = _selected_company.set(company_name or None)
+    try:
+        yield
+    finally:
+        _selected_company.reset(token)
+
+
+def _company_name():
+    return _selected_company.get() or os.environ.get("TALLY_COMPANY_NAME")
+
+
+def _post_vouchers_in_batches(vouchers):
+    batches = list(_chunks(vouchers, _tally_voucher_batch_size()))
+    summary = _empty_tally_summary()
+    summary["batches"] = len(batches)
+
+    for index, batch in enumerate(batches, start=1):
+        print(
+            "posting tally voucher batch:",
+            f"batch={index}/{len(batches)}",
+            f"vouchers={len(batch)}",
+            flush=True,
+        )
+        tally_xml = _build_envelope(batch)
+        response_text = _send_to_tally(tally_xml)
+        batch_summary = _parse_tally_response(response_text)
+        summary["created"] += batch_summary["created"]
+        summary["altered"] += batch_summary["altered"]
+        summary["errors"] += batch_summary["errors"]
+        summary["line_errors"].extend(batch_summary["line_errors"])
+        summary["raw_batches"].append(batch_summary.get("raw", ""))
+
+    return summary
+
+
+def _empty_tally_summary():
+    return {
+        "created": 0,
+        "altered": 0,
+        "errors": 0,
+        "line_errors": [],
+        "raw_batches": [],
+        "batches": 0,
+    }
+
+
+def _tally_voucher_batch_size():
+    return max(1, int(_number(os.environ.get("TALLY_VOUCHER_BATCH_SIZE")) or DEFAULT_TALLY_VOUCHER_BATCH_SIZE))
+
+
+def _tally_lookup_batch_size():
+    return max(1, int(_number(os.environ.get("TALLY_LOOKUP_BATCH_SIZE")) or DEFAULT_TALLY_LOOKUP_BATCH_SIZE))
+
+
+def _tally_master_batch_size():
+    return max(1, int(_number(os.environ.get("TALLY_MASTER_BATCH_SIZE")) or DEFAULT_TALLY_MASTER_BATCH_SIZE))
+
+
+def _chunks(items, size):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def _bank_voucher_number(statement, transaction, tally_date, amount, direction, bank_ledger):
+    parts = [
+        bank_ledger,
+        statement.get("account_number") or "NoAccount",
+        tally_date,
+        transaction.get("reference") or "NoRef",
+        direction,
+        f"{amount:.2f}",
+    ]
+    return "/".join(_voucher_number_part(part) for part in parts)
+
+
+def _voucher_number_part(value):
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+    cleaned = cleaned.replace("/", "-").replace("|", "-")
+    return cleaned or "NA"
+
+
+def _unique_vouchers(vouchers):
+    unique_vouchers = []
+    seen_keys = set()
+    duplicate_count = 0
+
+    for voucher in vouchers:
+        voucher_key = _voucher_key(voucher)
+        if voucher_key in seen_keys:
+            duplicate_count += 1
+            continue
+        seen_keys.add(voucher_key)
+        unique_vouchers.append(voucher)
+
+    return unique_vouchers, duplicate_count
+
+
 def _bank_statement_vouchers(statement):
-    bank_ledger = _env("TALLY_BANK_LEDGER", statement.get("bank") or "Bank")
+    bank_ledger = _bank_ledger(statement)
     transactions = statement.get("transactions") or []
     party_ledgers_by_identifier = _bank_statement_party_ledgers(transactions)
     vouchers = []
@@ -73,17 +216,23 @@ def _bank_statement_vouchers(statement):
             _prefixed("Mode", transaction.get("mode")),
         )
 
-        if direction == "credit":
+        if direction == "credit" and _is_cash_movement(transaction):
+            voucher_type = "Payment"
+            entries = [
+                LedgerEntry(bank_ledger, amount, True, is_bank=True),
+                LedgerEntry(party_ledger, amount, False, is_party=True),
+            ]
+        elif direction == "credit":
             voucher_type = "Receipt"
             entries = [
-                LedgerEntry(bank_ledger, amount, True),
+                LedgerEntry(bank_ledger, amount, True, is_bank=True),
                 LedgerEntry(party_ledger, amount, False, is_party=True),
             ]
         elif direction == "debit":
             voucher_type = "Payment"
             entries = [
                 LedgerEntry(party_ledger, amount, True, is_party=True),
-                LedgerEntry(bank_ledger, amount, False),
+                LedgerEntry(bank_ledger, amount, False, is_bank=True),
             ]
         else:
             raise ValueError(f"Transaction {index} has an unsupported direction.")
@@ -92,7 +241,7 @@ def _bank_statement_vouchers(statement):
             {
                 "date": date,
                 "voucher_type": voucher_type,
-                "voucher_number": transaction.get("tran_id") or transaction.get("reference") or "",
+                "voucher_number": _bank_voucher_number(statement, transaction, date, amount, direction, bank_ledger),
                 "party_ledger": party_ledger,
                 "narration": narration,
                 "entries": entries,
@@ -100,6 +249,20 @@ def _bank_statement_vouchers(statement):
         )
 
     return vouchers
+
+
+def _bank_ledger(statement):
+    configured_ledger = _clean_text(os.environ.get("TALLY_BANK_LEDGER"))
+    statement_bank = _clean_text(statement.get("bank"))
+    bank_ledger = configured_ledger or statement_bank
+
+    if not bank_ledger or bank_ledger.lower() == "bank":
+        raise ValueError(
+            "Bank statement needs a real bank ledger before posting. "
+            "Set the Statement Bank field to the Tally bank ledger, for example 'ICICI Bank'."
+        )
+
+    return bank_ledger
 
 
 def _invoice_vouchers(source, invoice):
@@ -114,25 +277,34 @@ def _invoice_vouchers(source, invoice):
     _validate_invoice_financial_year(invoice.get("invoice_no"), date)
     grand_total = _number(totals.get("grand_total"))
     taxable_amount = _number(totals.get("taxable_amount"))
+    base_amount = taxable_amount or grand_total
 
     if grand_total <= 0:
         raise ValueError("Invoice grand_total must be greater than zero.")
 
+    inventory_entries = _invoice_inventory_entries(
+        invoice,
+        base_ledger,
+        is_debit=is_purchase,
+        fallback_amount=base_amount,
+    )
+    base_entries = [] if inventory_entries else [LedgerEntry(base_ledger, base_amount, is_purchase)]
+
     if is_purchase:
         entries = [
-            LedgerEntry(base_ledger, taxable_amount or grand_total, True),
+            *base_entries,
             *_tax_entries(totals, input_tax=True),
             *_invoice_charge_entries(invoice, is_debit=True),
         ]
     else:
         entries = [
-            LedgerEntry(base_ledger, taxable_amount or grand_total, False),
+            *base_entries,
             *_tax_entries(totals, input_tax=False),
             *_invoice_charge_entries(invoice, is_debit=False),
         ]
 
     entries = [entry for entry in entries if abs(entry.amount) > 0]
-    entries.insert(0, _counterparty_entry(party_ledger, entries))
+    entries.insert(0, _counterparty_entry(party_ledger, entries, inventory_entries))
 
     return [
         {
@@ -146,6 +318,7 @@ def _invoice_vouchers(source, invoice):
                 _prefixed("Ack", invoice.get("ack_no")),
             ),
             "entries": entries,
+            "inventory_entries": inventory_entries,
         }
     ]
 
@@ -164,6 +337,32 @@ def _tax_entries(totals, input_tax):
         for field, ledger_name in tax_fields
         if _number(totals.get(field)) > 0
     ]
+
+
+def _invoice_inventory_entries(invoice, ledger_name, is_debit, fallback_amount):
+    items = invoice.get("items") or []
+    inventory_entries = []
+
+    for item in items:
+        item_name = _clean_text(item.get("description")) or _env("TALLY_DEFAULT_STOCK_ITEM", "Item")
+        amount = _number(item.get("line_total")) or _number(item.get("taxable_amount"))
+        if amount == 0 and len(items) == 1:
+            amount = fallback_amount
+        if amount == 0:
+            continue
+
+        inventory_entries.append(
+            InventoryEntry(
+                item_name=item_name,
+                ledger_name=ledger_name,
+                amount=abs(amount),
+                is_debit=is_debit if amount > 0 else not is_debit,
+                quantity=_clean_text(item.get("quantity")),
+                rate=_inventory_rate(item.get("rate"), item.get("quantity")),
+            )
+        )
+
+    return inventory_entries
 
 
 def _invoice_charge_entries(invoice, is_debit):
@@ -209,19 +408,40 @@ def _charge_ledger(line_type, description):
 
 def _ensure_tally_masters(vouchers):
     ledger_specs = _ledger_specs_for_vouchers(vouchers)
-    if not ledger_specs:
-        return
-
-    ledger_names = sorted(ledger_specs)
-    ledgers = _fetch_ledgers(ledger_names)
-    missing_ledgers = [ledger_name for ledger_name in ledger_names if ledger_name not in ledgers]
-    if missing_ledgers:
-        _create_ledgers({ledger_name: ledger_specs[ledger_name] for ledger_name in missing_ledgers})
+    ledgers = {}
+    if ledger_specs:
+        ledger_names = sorted(ledger_specs)
         ledgers = _fetch_ledgers(ledger_names)
         missing_ledgers = [ledger_name for ledger_name in ledger_names if ledger_name not in ledgers]
+        if missing_ledgers:
+            _create_ledgers({ledger_name: ledger_specs[ledger_name] for ledger_name in missing_ledgers})
+            ledgers = _fetch_ledgers(ledger_names)
+            missing_ledgers = [ledger_name for ledger_name in ledger_names if ledger_name not in ledgers]
+        if missing_ledgers:
+            _create_ledgers_individually({ledger_name: ledger_specs[ledger_name] for ledger_name in missing_ledgers})
+            ledgers = _fetch_ledgers(ledger_names)
+            missing_ledgers = [ledger_name for ledger_name in ledger_names if ledger_name not in ledgers]
 
-    if missing_ledgers:
-        raise ValueError(f"Could not create these Tally ledgers: {', '.join(missing_ledgers)}.")
+        if missing_ledgers:
+            raise ValueError(
+                "Could not create these Tally ledgers: "
+                + ", ".join(_missing_ledger_detail(ledger_name, ledger_specs) for ledger_name in missing_ledgers)
+                + "."
+            )
+
+    stock_item_specs = _stock_item_specs_for_vouchers(vouchers)
+    if stock_item_specs:
+        _ensure_units({spec["unit"] for spec in stock_item_specs.values() if spec.get("unit")})
+        stock_item_names = sorted(stock_item_specs)
+        stock_items = _fetch_stock_items(stock_item_names)
+        missing_stock_items = [item_name for item_name in stock_item_names if item_name not in stock_items]
+        if missing_stock_items:
+            _create_stock_items({item_name: stock_item_specs[item_name] for item_name in missing_stock_items})
+            stock_items = _fetch_stock_items(stock_item_names)
+            missing_stock_items = [item_name for item_name in stock_item_names if item_name not in stock_items]
+
+        if missing_stock_items:
+            raise ValueError(f"Could not create these Tally stock items: {', '.join(missing_stock_items)}.")
 
     for voucher in vouchers:
         voucher_type = voucher["voucher_type"]
@@ -257,22 +477,58 @@ def _ledger_specs_for_vouchers(vouchers):
                     "is_billwise_on": "Yes" if entry.is_party else "No",
                 },
             )
+        for entry in voucher.get("inventory_entries") or []:
+            if not entry.ledger_name:
+                continue
+            specs.setdefault(
+                entry.ledger_name,
+                {
+                    "parent": _ledger_parent(voucher_type, entry),
+                    "is_billwise_on": "No",
+                },
+            )
+
+    return specs
+
+
+def _missing_ledger_detail(ledger_name, ledger_specs):
+    parent = (ledger_specs.get(ledger_name) or {}).get("parent")
+    return f"{ledger_name} (parent: {parent})" if parent else ledger_name
+
+
+def _stock_item_specs_for_vouchers(vouchers):
+    specs = {}
+
+    for voucher in vouchers:
+        for entry in voucher.get("inventory_entries") or []:
+            if not entry.item_name:
+                continue
+            specs.setdefault(
+                entry.item_name,
+                {
+                    "parent": _env("TALLY_STOCK_ITEM_PARENT", "Primary"),
+                    "unit": _stock_unit(entry.quantity),
+                },
+            )
 
     return specs
 
 
 def _ledger_parent(voucher_type, entry):
     ledger_name = entry.ledger_name.lower()
+    is_party = getattr(entry, "is_party", False)
 
-    if entry.is_party and voucher_type == "Sales":
+    if getattr(entry, "is_bank", False):
+        return "Bank Accounts"
+    if is_party and voucher_type == "Sales":
         return "Sundry Debtors"
-    if entry.is_party and voucher_type == "Purchase":
+    if is_party and voucher_type == "Purchase":
         return "Sundry Creditors"
     if ledger_name == _env("TALLY_BANK_LEDGER", "Bank").lower():
         return "Bank Accounts"
-    if voucher_type == "Receipt" and entry.is_party:
+    if voucher_type == "Receipt" and is_party:
         return "Sundry Debtors"
-    if voucher_type == "Payment" and entry.is_party:
+    if voucher_type == "Payment" and is_party:
         return "Sundry Creditors"
     if ledger_name == _env("TALLY_SALES_LEDGER", "Sales").lower():
         return "Sales Accounts"
@@ -285,42 +541,32 @@ def _ledger_parent(voucher_type, entry):
 
 
 def _create_ledgers(ledger_specs):
-    print(
-        "creating missing tally ledgers:",
-        ", ".join(sorted(ledger_specs)),
-        flush=True,
-    )
-    ledger_messages = "".join(
-        _ledger_master_xml(ledger_name, spec)
-        for ledger_name, spec in sorted(ledger_specs.items())
-    )
-    company_name = os.environ.get("TALLY_COMPANY_NAME")
-    company_variable = (
-        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
-        if company_name
-        else ""
-    )
-    request_xml = (
-        "<ENVELOPE>"
-        "<HEADER>"
-        "<VERSION>1</VERSION>"
-        "<TALLYREQUEST>Import</TALLYREQUEST>"
-        "<TYPE>Data</TYPE>"
-        "<ID>All Masters</ID>"
-        "</HEADER>"
-        "<BODY>"
-        "<DESC>"
-        "<STATICVARIABLES>"
-        "<SVMSTIMPORTFORMAT>XML</SVMSTIMPORTFORMAT>"
-        f"{company_variable}"
-        "</STATICVARIABLES>"
-        "</DESC>"
-        f"<DATA>{ledger_messages}</DATA>"
-        "</BODY>"
-        "</ENVELOPE>"
-    )
-    response_text = _post_xml_to_tally(request_xml)
-    _raise_for_tally_line_errors(response_text, "creating missing ledgers")
+    batches = list(_chunks(sorted(ledger_specs.items()), _tally_master_batch_size()))
+    for index, batch in enumerate(batches, start=1):
+        print(
+            "creating missing tally ledgers:",
+            f"batch={index}/{len(batches)}",
+            ", ".join(ledger_name for ledger_name, _ in batch),
+            flush=True,
+        )
+        ledger_messages = "".join(
+            _ledger_master_xml(ledger_name, spec)
+            for ledger_name, spec in batch
+        )
+        response_text = _post_xml_to_tally(_master_import_envelope(ledger_messages))
+        _raise_for_tally_line_errors(response_text, f"creating missing ledgers batch {index}/{len(batches)}")
+
+
+def _create_ledgers_individually(ledger_specs):
+    for ledger_name, spec in sorted(ledger_specs.items()):
+        print(
+            "retrying missing tally ledger individually:",
+            ledger_name,
+            f"parent={spec.get('parent')}",
+            flush=True,
+        )
+        response_text = _post_xml_to_tally(_master_import_envelope(_ledger_master_xml(ledger_name, spec)))
+        _raise_for_tally_line_errors(response_text, f"creating missing ledger '{ledger_name}'")
 
 
 def _ledger_master_xml(ledger_name, spec):
@@ -335,14 +581,227 @@ def _ledger_master_xml(ledger_name, spec):
     )
 
 
+def _master_import_envelope(master_messages):
+    company_name = _company_name()
+    company_variable = (
+        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
+        if company_name
+        else ""
+    )
+    return (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Import</TALLYREQUEST>"
+        "<TYPE>Data</TYPE>"
+        "<ID>All Masters</ID>"
+        "</HEADER>"
+        "<BODY>"
+        "<DESC>"
+        "<STATICVARIABLES>"
+        "<SVMSTIMPORTFORMAT>XML</SVMSTIMPORTFORMAT>"
+        f"{company_variable}"
+        "</STATICVARIABLES>"
+        "</DESC>"
+        f"<DATA>{master_messages}</DATA>"
+        "</BODY>"
+        "</ENVELOPE>"
+    )
+
+
+def _ensure_units(unit_names):
+    unit_names = sorted({unit_name for unit_name in unit_names if unit_name})
+    if not unit_names:
+        return
+
+    units = _fetch_units(unit_names)
+    missing_units = [unit_name for unit_name in unit_names if unit_name not in units]
+    if not missing_units:
+        return
+
+    _create_units(missing_units)
+    units = _fetch_units(unit_names)
+    missing_units = [unit_name for unit_name in unit_names if unit_name not in units]
+    if missing_units:
+        raise ValueError(f"Could not create these Tally units: {', '.join(missing_units)}.")
+
+
+def _fetch_units(unit_names):
+    units = set()
+    for batch in _chunks(sorted(unit_names), _tally_lookup_batch_size()):
+        units.update(_fetch_units_batch(batch))
+    return units
+
+
+def _fetch_units_batch(unit_names):
+    formula = " OR ".join(f'$Name = "{_xml(unit_name)}"' for unit_name in unit_names)
+    company_name = _company_name()
+    company_variable = (
+        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
+        if company_name
+        else ""
+    )
+    request_xml = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>Units</ID>"
+        "</HEADER>"
+        "<BODY>"
+        "<DESC>"
+        "<STATICVARIABLES>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"{company_variable}"
+        "</STATICVARIABLES>"
+        "<TDL>"
+        "<TDLMESSAGE>"
+        '<COLLECTION NAME="Units">'
+        "<TYPE>Unit</TYPE>"
+        "<FETCH>Name</FETCH>"
+        "<FILTERS>TargetUnits</FILTERS>"
+        "</COLLECTION>"
+        f'<SYSTEM TYPE="Formulae" NAME="TargetUnits">{formula}</SYSTEM>'
+        "</TDLMESSAGE>"
+        "</TDL>"
+        "</DESC>"
+        "</BODY>"
+        "</ENVELOPE>"
+    )
+
+    response_text = _post_xml_to_tally(request_xml)
+    root = ElementTree.fromstring(response_text)
+    return {
+        (unit.attrib.get("NAME") or unit.findtext("NAME") or "").strip()
+        for unit in root.findall(".//UNIT")
+        if (unit.attrib.get("NAME") or unit.findtext("NAME") or "").strip()
+    }
+
+
+def _create_units(unit_names):
+    batches = list(_chunks(sorted(unit_names), _tally_master_batch_size()))
+    for index, batch in enumerate(batches, start=1):
+        print(
+            "creating missing tally units:",
+            f"batch={index}/{len(batches)}",
+            ", ".join(batch),
+            flush=True,
+        )
+        unit_messages = "".join(_unit_master_xml(unit_name) for unit_name in batch)
+        response_text = _post_xml_to_tally(_master_import_envelope(unit_messages))
+        _raise_for_tally_line_errors(response_text, f"creating missing units batch {index}/{len(batches)}")
+
+
+def _unit_master_xml(unit_name):
+    formal_name = _unit_formal_name(unit_name)
+    return (
+        '<TALLYMESSAGE xmlns:UDF="TallyUDF">'
+        f'<UNIT NAME="{_xml(unit_name)}" ACTION="Create">'
+        f"<NAME>{_xml(unit_name)}</NAME>"
+        f"<ORIGINALNAME>{_xml(unit_name)}</ORIGINALNAME>"
+        "<ISSIMPLEUNIT>Yes</ISSIMPLEUNIT>"
+        f"<SYMBOL>{_xml(unit_name)}</SYMBOL>"
+        f"<FORMALNAME>{_xml(formal_name)}</FORMALNAME>"
+        "<NUMBEROFDECIMALPLACES>3</NUMBEROFDECIMALPLACES>"
+        "</UNIT>"
+        "</TALLYMESSAGE>"
+    )
+
+
+def _fetch_stock_items(item_names):
+    stock_items = set()
+    for batch in _chunks(sorted(item_names), _tally_lookup_batch_size()):
+        stock_items.update(_fetch_stock_items_batch(batch))
+    return stock_items
+
+
+def _fetch_stock_items_batch(item_names):
+    formula = " OR ".join(f'$Name = "{_xml(item_name)}"' for item_name in item_names)
+    company_name = _company_name()
+    company_variable = (
+        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
+        if company_name
+        else ""
+    )
+    request_xml = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>StockItems</ID>"
+        "</HEADER>"
+        "<BODY>"
+        "<DESC>"
+        "<STATICVARIABLES>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"{company_variable}"
+        "</STATICVARIABLES>"
+        "<TDL>"
+        "<TDLMESSAGE>"
+        '<COLLECTION NAME="StockItems">'
+        "<TYPE>StockItem</TYPE>"
+        "<FETCH>Name</FETCH>"
+        "<FILTERS>TargetStockItems</FILTERS>"
+        "</COLLECTION>"
+        f'<SYSTEM TYPE="Formulae" NAME="TargetStockItems">{formula}</SYSTEM>'
+        "</TDLMESSAGE>"
+        "</TDL>"
+        "</DESC>"
+        "</BODY>"
+        "</ENVELOPE>"
+    )
+
+    response_text = _post_xml_to_tally(request_xml)
+    root = ElementTree.fromstring(response_text)
+    return {
+        (item.attrib.get("NAME") or item.findtext("NAME") or "").strip()
+        for item in root.findall(".//STOCKITEM")
+        if (item.attrib.get("NAME") or item.findtext("NAME") or "").strip()
+    }
+
+
+def _create_stock_items(stock_item_specs):
+    batches = list(_chunks(sorted(stock_item_specs.items()), _tally_master_batch_size()))
+    for index, batch in enumerate(batches, start=1):
+        print(
+            "creating missing tally stock items:",
+            f"batch={index}/{len(batches)}",
+            ", ".join(item_name for item_name, _ in batch),
+            flush=True,
+        )
+        stock_item_messages = "".join(
+            _stock_item_master_xml(item_name, spec)
+            for item_name, spec in batch
+        )
+        response_text = _post_xml_to_tally(_master_import_envelope(stock_item_messages))
+        _raise_for_tally_line_errors(response_text, f"creating missing stock items batch {index}/{len(batches)}")
+
+
+def _stock_item_master_xml(item_name, spec):
+    return (
+        '<TALLYMESSAGE xmlns:UDF="TallyUDF">'
+        f'<STOCKITEM NAME="{_xml(item_name)}" ACTION="Create">'
+        f"<NAME>{_xml(item_name)}</NAME>"
+        f"<PARENT>{_xml(spec['parent'])}</PARENT>"
+        f"<BASEUNITS>{_xml(spec['unit'])}</BASEUNITS>"
+        "</STOCKITEM>"
+        "</TALLYMESSAGE>"
+    )
+
+
 def _ensure_tally_company():
-    company_name = os.environ.get("TALLY_COMPANY_NAME")
+    company_name = _company_name()
     if not company_name:
         return
 
     companies = _fetch_companies()
     if company_name in companies:
         return
+
+    if _selected_company.get():
+        raise ValueError(f"Tally company '{company_name}' is not loaded or does not exist.")
 
     _create_company(company_name)
     companies = _fetch_companies()
@@ -422,8 +881,16 @@ def _create_company(company_name):
 
 
 def _fetch_ledgers(ledger_names):
+    ledgers = {}
+    for batch in _chunks(sorted(ledger_names), _tally_lookup_batch_size()):
+        ledgers.update(_fetch_ledgers_batch(batch))
+    return ledgers
+
+
+def _fetch_ledgers_batch(ledger_names):
+    requested_names_by_lower = {ledger_name.lower(): ledger_name for ledger_name in ledger_names}
     formula = " OR ".join(f'$Name = "{_xml(ledger_name)}"' for ledger_name in ledger_names)
-    company_name = os.environ.get("TALLY_COMPANY_NAME")
+    company_name = _company_name()
     company_variable = (
         f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
         if company_name
@@ -462,16 +929,112 @@ def _fetch_ledgers(ledger_names):
     root = ElementTree.fromstring(response_text)
     ledgers = {}
     for ledger in root.findall(".//LEDGER"):
-        name = ledger.attrib.get("NAME")
+        name = (ledger.attrib.get("NAME") or "").strip()
         parent = ledger.findtext("PARENT") or ""
         if name:
-            ledgers[name] = {"parent": parent.strip()}
+            spec = {"parent": parent.strip()}
+            ledgers[name] = spec
+            requested_name = requested_names_by_lower.get(name.lower())
+            if requested_name:
+                ledgers[requested_name] = spec
+            for alias in _ledger_aliases(ledger):
+                ledgers[alias] = spec
+                requested_alias = requested_names_by_lower.get(alias.lower())
+                if requested_alias:
+                    ledgers[requested_alias] = spec
 
     return ledgers
 
 
-def _counterparty_entry(party_ledger, entries):
+def _ledger_aliases(ledger):
+    return {
+        alias.text.strip()
+        for alias in ledger.findall(".//NAME.LIST/NAME")
+        if alias.text and alias.text.strip()
+    }
+
+
+def _fetch_existing_voucher_keys(vouchers):
+    voucher_keys = {
+        _voucher_key(voucher)
+        for voucher in vouchers
+        if voucher.get("voucher_type") and voucher.get("voucher_number")
+    }
+    if not voucher_keys:
+        return set()
+
+    existing_keys = set()
+    for batch in _chunks(sorted(voucher_keys), _tally_lookup_batch_size()):
+        existing_keys.update(_fetch_existing_voucher_keys_batch(batch))
+
+    return existing_keys
+
+
+def _fetch_existing_voucher_keys_batch(voucher_keys):
+    filters = " OR ".join(
+        (
+            "("
+            f'$VoucherTypeName = "{_xml(voucher_type)}"'
+            " AND "
+            f'$VoucherNumber = "{_xml(voucher_number)}"'
+            ")"
+        )
+        for voucher_type, voucher_number in voucher_keys
+    )
+    company_name = _company_name()
+    company_variable = (
+        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
+        if company_name
+        else ""
+    )
+    request_xml = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>ExistingVouchers</ID>"
+        "</HEADER>"
+        "<BODY>"
+        "<DESC>"
+        "<STATICVARIABLES>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"{company_variable}"
+        "</STATICVARIABLES>"
+        "<TDL>"
+        "<TDLMESSAGE>"
+        '<COLLECTION NAME="ExistingVouchers">'
+        "<TYPE>Voucher</TYPE>"
+        "<FETCH>VoucherTypeName,VoucherNumber</FETCH>"
+        "<FILTERS>TargetVouchers</FILTERS>"
+        "</COLLECTION>"
+        f'<SYSTEM TYPE="Formulae" NAME="TargetVouchers">{filters}</SYSTEM>'
+        "</TDLMESSAGE>"
+        "</TDL>"
+        "</DESC>"
+        "</BODY>"
+        "</ENVELOPE>"
+    )
+
+    response_text = _post_xml_to_tally(request_xml)
+    root = ElementTree.fromstring(response_text)
+    existing_keys = set()
+    for voucher in root.findall(".//VOUCHER"):
+        voucher_type = (voucher.findtext("VOUCHERTYPENAME") or "").strip()
+        voucher_number = (voucher.findtext("VOUCHERNUMBER") or "").strip()
+        if voucher_type and voucher_number:
+            existing_keys.add((voucher_type, voucher_number))
+
+    return existing_keys
+
+
+def _voucher_key(voucher):
+    return (voucher.get("voucher_type") or "", voucher.get("voucher_number") or "")
+
+
+def _counterparty_entry(party_ledger, entries, inventory_entries=None):
     balance = sum(_signed_amount(entry) for entry in entries)
+    balance += sum(_signed_inventory_amount(entry) for entry in inventory_entries or [])
     if balance == 0:
         raise ValueError("Invoice voucher has no ledger amount to balance.")
 
@@ -479,6 +1042,10 @@ def _counterparty_entry(party_ledger, entries):
 
 
 def _signed_amount(entry):
+    return abs(entry.amount) if entry.is_debit else -abs(entry.amount)
+
+
+def _signed_inventory_amount(entry):
     return abs(entry.amount) if entry.is_debit else -abs(entry.amount)
 
 
@@ -516,7 +1083,7 @@ def _validate_invoice_financial_year(invoice_no, tally_date):
 
 
 def _build_envelope(vouchers):
-    company_name = os.environ.get("TALLY_COMPANY_NAME")
+    company_name = _company_name()
     import_id = os.environ.get("TALLY_IMPORT_ID", "Vouchers")
     static_variables = "<SVMSTIMPORTFORMAT>XML</SVMSTIMPORTFORMAT>"
     if company_name:
@@ -544,9 +1111,20 @@ def _build_envelope(vouchers):
 
 def _voucher_xml(voucher):
     entries = "".join(_ledger_entry_xml(entry) for entry in voucher["entries"])
+    inventory_entries = "".join(
+        _inventory_entry_xml(entry)
+        for entry in voucher.get("inventory_entries") or []
+    )
     voucher_date = _xml(voucher["date"])
+    narration = _xml(voucher.get("narration") or "")
+    narration_xml = f"<NARRATION>{narration}</NARRATION>" if narration else ""
     voucher_number = _xml(voucher.get("voucher_number") or "")
     voucher_number_xml = f"<VOUCHERNUMBER>{voucher_number}</VOUCHERNUMBER>" if voucher_number else ""
+    voucher_view = _voucher_view(voucher)
+    voucher_view_xml = (
+        f"<PERSISTEDVIEW>{_xml(voucher_view)}</PERSISTEDVIEW>"
+        f"<OBJVIEW>{_xml(voucher_view)}</OBJVIEW>"
+    )
 
     return (
         '<TALLYMESSAGE xmlns:UDF="TallyUDF">'
@@ -554,17 +1132,20 @@ def _voucher_xml(voucher):
         f"<DATE>{voucher_date}</DATE>"
         f"<EFFECTIVEDATE>{voucher_date}</EFFECTIVEDATE>"
         f"<VOUCHERTYPENAME>{_xml(voucher['voucher_type'])}</VOUCHERTYPENAME>"
+        f"{voucher_view_xml}"
         f"{voucher_number_xml}"
+        f"{narration_xml}"
         f"<PARTYLEDGERNAME>{_xml(voucher.get('party_ledger') or '')}</PARTYLEDGERNAME>"
         f"<ISINVOICE>{_is_invoice_voucher(voucher)}</ISINVOICE>"
         f"{entries}"
+        f"{inventory_entries}"
         "</VOUCHER>"
         "</TALLYMESSAGE>"
     )
 
 
 def _ledger_entry_xml(entry):
-    amount = abs(entry.amount) if entry.is_debit else -abs(entry.amount)
+    amount = _tally_amount(entry)
     deemed_positive = "Yes" if entry.is_debit else "No"
     is_party_ledger = "Yes" if entry.is_party else "No"
 
@@ -576,6 +1157,45 @@ def _ledger_entry_xml(entry):
         f"<AMOUNT>{amount:.2f}</AMOUNT>"
         "</ALLLEDGERENTRIES.LIST>"
     )
+
+
+def _voucher_view(voucher):
+    if voucher.get("voucher_type") in {"Receipt", "Payment", "Contra", "Journal"}:
+        return "Accounting Voucher View"
+    if voucher.get("inventory_entries"):
+        return "Invoice Voucher View"
+    return "Accounting Voucher View"
+
+
+def _inventory_entry_xml(entry):
+    amount = _tally_amount(entry)
+    deemed_positive = "Yes" if entry.is_debit else "No"
+    quantity_xml = ""
+    if entry.quantity:
+        quantity_xml = (
+            f"<ACTUALQTY>{_xml(entry.quantity)}</ACTUALQTY>"
+            f"<BILLEDQTY>{_xml(entry.quantity)}</BILLEDQTY>"
+        )
+    rate_xml = f"<RATE>{_xml(entry.rate)}</RATE>" if entry.rate else ""
+
+    return (
+        "<ALLINVENTORYENTRIES.LIST>"
+        f"<STOCKITEMNAME>{_xml(entry.item_name)}</STOCKITEMNAME>"
+        f"<ISDEEMEDPOSITIVE>{deemed_positive}</ISDEEMEDPOSITIVE>"
+        f"{quantity_xml}"
+        f"{rate_xml}"
+        f"<AMOUNT>{amount:.2f}</AMOUNT>"
+        "<ACCOUNTINGALLOCATIONS.LIST>"
+        f"<LEDGERNAME>{_xml(entry.ledger_name)}</LEDGERNAME>"
+        f"<ISDEEMEDPOSITIVE>{deemed_positive}</ISDEEMEDPOSITIVE>"
+        f"<AMOUNT>{amount:.2f}</AMOUNT>"
+        "</ACCOUNTINGALLOCATIONS.LIST>"
+        "</ALLINVENTORYENTRIES.LIST>"
+    )
+
+
+def _tally_amount(entry):
+    return -abs(entry.amount) if entry.is_debit else abs(entry.amount)
 
 
 def _is_invoice_voucher(voucher):
@@ -610,11 +1230,14 @@ def _send_to_tally(tally_xml):
 
 def _post_xml_to_tally(tally_xml):
     tally_url = os.environ.get("TALLY_URL", DEFAULT_TALLY_URL)
+    timeout_seconds = _number(os.environ.get("TALLY_TIMEOUT_SECONDS")) or DEFAULT_TALLY_TIMEOUT_SECONDS
+    _write_tally_debug_file("TALLY_DEBUG_XML_PATH", "last-tally-request.xml", tally_xml, "request")
     print(
         "posting xml to tally:",
         f"url={tally_url}",
-        f"company={os.environ.get('TALLY_COMPANY_NAME') or '(active company)'}",
+        f"company={_company_name() or '(active company)'}",
         f"import_id={os.environ.get('TALLY_IMPORT_ID', 'Vouchers')}",
+        f"timeout={timeout_seconds:g}s",
         f"bytes={len(tally_xml.encode('utf-8'))}",
         flush=True,
     )
@@ -626,11 +1249,38 @@ def _post_xml_to_tally(tally_xml):
     )
 
     try:
-        with urlopen(request, timeout=30) as response:
-            return response.read().decode("utf-8", errors="replace")
+        with urlopen(request, timeout=timeout_seconds) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+            _write_tally_debug_file("TALLY_DEBUG_RESPONSE_PATH", "last-tally-response.xml", response_text, "response")
+            return response_text
+    except TimeoutError as error:
+        raise RuntimeError(
+            f"Tally did not respond within {timeout_seconds:g} seconds at {tally_url}. "
+            "Check that Tally is running, the company is open, and HTTP access is enabled."
+        ) from error
     except URLError as error:
         reason = getattr(error, "reason", error)
+        if isinstance(reason, TimeoutError):
+            raise RuntimeError(
+                f"Tally did not respond within {timeout_seconds:g} seconds at {tally_url}. "
+                "Check that Tally is running, the company is open, and HTTP access is enabled."
+            ) from error
         raise RuntimeError(f"Could not reach Tally at {tally_url}: {reason}") from error
+
+
+def _write_tally_debug_file(env_name, default_path, content, label):
+    debug_path = os.environ.get(env_name, default_path)
+    if not debug_path:
+        return
+
+    path = Path(debug_path).resolve()
+    path.write_text(content, encoding="utf-8")
+    print(
+        f"tally {label} xml saved:",
+        f"path={path}",
+        f"bytes={path.stat().st_size}",
+        flush=True,
+    )
 
 
 def _parse_tally_response(response_text):
@@ -692,6 +1342,14 @@ def _party_ledger(transaction):
     )
 
 
+def _is_cash_movement(transaction):
+    mode = str(transaction.get("mode") or "").strip().lower()
+    party_name = str(transaction.get("party_name") or "").strip().lower()
+    party_identifier = str(transaction.get("party_identifier") or "").strip().lower()
+
+    return "cash" in {mode, party_name, party_identifier}
+
+
 def _bank_statement_party_ledgers(transactions):
     ledger_by_identifier = {}
 
@@ -717,6 +1375,80 @@ def _clean_text(value):
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _quantity_unit(quantity):
+    text = _clean_text(quantity)
+    if not text:
+        return ""
+
+    without_numbers = re.sub(r"[-+]?\d[\d,]*(?:\.\d+)?", "", text)
+    without_separators = re.sub(r"[/()]", " ", without_numbers)
+    unit = re.sub(r"\s+", " ", without_separators).strip()
+    return unit or ""
+
+
+def _stock_unit(quantity):
+    unit = _quantity_unit(quantity) or _env("TALLY_DEFAULT_STOCK_UNIT", "Nos")
+    return _unit_alias(unit)
+
+
+def _unit_alias(unit):
+    normalized_unit = _clean_text(unit)
+    aliases = _mapping_env(
+        "TALLY_STOCK_UNIT_ALIASES",
+        {
+            "mt": "MT",
+            "mts": "MT",
+            "m.t.": "MT",
+            "metric ton": "MT",
+            "metric tons": "MT",
+            "ton": "MT",
+            "tons": "MT",
+            "tonne": "MT",
+            "tonnes": "MT",
+            "nos": "Nos",
+            "no": "Nos",
+            "pcs": "Nos",
+            "piece": "Nos",
+            "pieces": "Nos",
+        },
+    )
+    return aliases.get(normalized_unit.lower(), normalized_unit)
+
+
+def _unit_formal_name(unit_name):
+    formal_names = _mapping_env(
+        "TALLY_STOCK_UNIT_FORMAL_NAMES",
+        {
+            "mt": "Metric Ton",
+            "nos": "Numbers",
+        },
+    )
+    return formal_names.get(_clean_text(unit_name).lower(), unit_name)
+
+
+def _mapping_env(name, defaults):
+    mapping = {str(key).lower(): value for key, value in defaults.items()}
+    raw = os.environ.get(name) or ""
+    for item in raw.split(","):
+        if ":" not in item:
+            continue
+        key, value = item.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key and value:
+            mapping[key] = value
+    return mapping
+
+
+def _inventory_rate(rate, quantity):
+    text = _clean_text(rate)
+    if not text or "/" in text:
+        return text
+
+    unit = _stock_unit(quantity)
+    return f"{text}/{unit}" if unit else text
 
 
 def _tally_date(value, field_name="date"):
