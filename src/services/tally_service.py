@@ -52,6 +52,51 @@ def list_tally_companies():
     return {"companies": sorted(_fetch_companies())}
 
 
+def list_tally_accounts(company_name=None):
+    with _tally_company(_clean_text(company_name)):
+        return {"accounts": _fetch_all_ledgers()}
+
+
+def list_tally_bank_accounts(company_name=None):
+    with _tally_company(_clean_text(company_name)):
+        return {
+            "accounts": [
+                account
+                for account in _fetch_all_ledgers()
+                if (account.get("parent") or "").strip().lower() == "bank accounts"
+            ]
+        }
+
+
+def create_tally_account(name, parent="Sundry Creditors", company_name=None):
+    ledger_name = _clean_text(name)
+    ledger_parent = _clean_text(parent) or "Sundry Creditors"
+
+    if not ledger_name:
+        raise ValueError("Account name is required.")
+
+    with _tally_company(_clean_text(company_name)):
+        existing_ledgers = _fetch_ledgers([ledger_name])
+        if ledger_name not in existing_ledgers:
+            _create_ledgers(
+                {
+                    ledger_name: {
+                        "parent": ledger_parent,
+                        "is_billwise_on": "Yes",
+                    }
+                }
+            )
+            existing_ledgers = _fetch_ledgers([ledger_name])
+
+        account = existing_ledgers.get(ledger_name) or {"parent": ledger_parent}
+        return {
+            "account": {
+                "name": ledger_name,
+                "parent": account.get("parent") or ledger_parent,
+            }
+        }
+
+
 def _post_to_tally(document_type, source, data):
 
     if document_type == "bank_statement":
@@ -198,7 +243,6 @@ def _unique_vouchers(vouchers):
 def _bank_statement_vouchers(statement):
     bank_ledger = _bank_ledger(statement)
     transactions = statement.get("transactions") or []
-    party_ledgers_by_identifier = _bank_statement_party_ledgers(transactions)
     vouchers = []
 
     for index, transaction in enumerate(transactions, start=1):
@@ -207,13 +251,13 @@ def _bank_statement_vouchers(statement):
             continue
 
         direction = str(transaction.get("direction") or "").lower()
-        party_identifier = _party_identifier(transaction)
-        party_ledger = party_ledgers_by_identifier.get(party_identifier) or _party_ledger(transaction)
+        party_ledger = _selected_transaction_account(transaction)
         date = _tally_date(transaction.get("value_date") or transaction.get("txn_date"), field_name="transaction date")
         narration = _join_narration(
             transaction.get("description"),
             _prefixed("Reference", transaction.get("reference")),
             _prefixed("Mode", transaction.get("mode")),
+            _prefixed("Account", party_ledger),
         )
 
         if direction == "credit" and _is_cash_movement(transaction):
@@ -253,13 +297,17 @@ def _bank_statement_vouchers(statement):
 
 def _bank_ledger(statement):
     configured_ledger = _clean_text(os.environ.get("TALLY_BANK_LEDGER"))
-    statement_bank = _clean_text(statement.get("bank"))
+    statement_bank = (
+        _clean_text(statement.get("bank_account_name"))
+        or _clean_text(statement.get("bank_ledger"))
+        or _clean_text(statement.get("bank"))
+    )
     bank_ledger = configured_ledger or statement_bank
 
     if not bank_ledger or bank_ledger.lower() == "bank":
         raise ValueError(
             "Bank statement needs a real bank ledger before posting. "
-            "Set the Statement Bank field to the Tally bank ledger, for example 'ICICI Bank'."
+            "Select the bank account ledger from Tally before posting."
         )
 
     return bank_ledger
@@ -671,7 +719,7 @@ def _fetch_units_batch(unit_names):
     )
 
     response_text = _post_xml_to_tally(request_xml)
-    root = ElementTree.fromstring(response_text)
+    root = _parse_tally_xml(response_text)
     return {
         (unit.attrib.get("NAME") or unit.findtext("NAME") or "").strip()
         for unit in root.findall(".//UNIT")
@@ -754,7 +802,7 @@ def _fetch_stock_items_batch(item_names):
     )
 
     response_text = _post_xml_to_tally(request_xml)
-    root = ElementTree.fromstring(response_text)
+    root = _parse_tally_xml(response_text)
     return {
         (item.attrib.get("NAME") or item.findtext("NAME") or "").strip()
         for item in root.findall(".//STOCKITEM")
@@ -837,7 +885,7 @@ def _fetch_companies():
     )
 
     response_text = _post_xml_to_tally(request_xml)
-    root = ElementTree.fromstring(response_text)
+    root = _parse_tally_xml(response_text)
     return {
         element.text.strip()
         for element in root.findall(".//COMPANY/NAME")
@@ -887,6 +935,60 @@ def _fetch_ledgers(ledger_names):
     return ledgers
 
 
+def _fetch_all_ledgers():
+    company_name = _company_name()
+    company_variable = (
+        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
+        if company_name
+        else ""
+    )
+    request_xml = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>AllLedgers</ID>"
+        "</HEADER>"
+        "<BODY>"
+        "<DESC>"
+        "<STATICVARIABLES>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"{company_variable}"
+        "</STATICVARIABLES>"
+        "<TDL>"
+        "<TDLMESSAGE>"
+        '<COLLECTION NAME="AllLedgers">'
+        "<TYPE>Ledger</TYPE>"
+        "<FETCH>Name,Parent</FETCH>"
+        "</COLLECTION>"
+        "</TDLMESSAGE>"
+        "</TDL>"
+        "</DESC>"
+        "</BODY>"
+        "</ENVELOPE>"
+    )
+
+    response_text = _post_xml_to_tally(request_xml)
+    root = _parse_tally_xml(response_text)
+    accounts = []
+    seen_names = set()
+
+    for ledger in root.findall(".//LEDGER"):
+        name = (ledger.attrib.get("NAME") or ledger.findtext("NAME") or "").strip()
+        if not name or name.lower() in seen_names:
+            continue
+        seen_names.add(name.lower())
+        accounts.append(
+            {
+                "name": name,
+                "parent": (ledger.findtext("PARENT") or "").strip(),
+            }
+        )
+
+    return sorted(accounts, key=lambda account: account["name"].lower())
+
+
 def _fetch_ledgers_batch(ledger_names):
     requested_names_by_lower = {ledger_name.lower(): ledger_name for ledger_name in ledger_names}
     formula = " OR ".join(f'$Name = "{_xml(ledger_name)}"' for ledger_name in ledger_names)
@@ -926,7 +1028,7 @@ def _fetch_ledgers_batch(ledger_names):
     )
 
     response_text = _post_xml_to_tally(request_xml)
-    root = ElementTree.fromstring(response_text)
+    root = _parse_tally_xml(response_text)
     ledgers = {}
     for ledger in root.findall(".//LEDGER"):
         name = (ledger.attrib.get("NAME") or "").strip()
@@ -1017,7 +1119,7 @@ def _fetch_existing_voucher_keys_batch(voucher_keys):
     )
 
     response_text = _post_xml_to_tally(request_xml)
-    root = ElementTree.fromstring(response_text)
+    root = _parse_tally_xml(response_text)
     existing_keys = set()
     for voucher in root.findall(".//VOUCHER"):
         voucher_type = (voucher.findtext("VOUCHERTYPENAME") or "").strip()
@@ -1293,7 +1395,7 @@ def _parse_tally_response(response_text):
     }
 
     try:
-        root = ElementTree.fromstring(response_text)
+        root = _parse_tally_xml(response_text)
     except ElementTree.ParseError:
         return summary
 
@@ -1316,7 +1418,7 @@ def _parse_tally_response(response_text):
 
 def _raise_for_tally_line_errors(response_text, context):
     try:
-        root = ElementTree.fromstring(response_text)
+        root = _parse_tally_xml(response_text)
     except ElementTree.ParseError as error:
         raise RuntimeError(f"Tally returned invalid XML while {context}.") from error
 
@@ -1340,6 +1442,25 @@ def _party_ledger(transaction):
         or _clean_text(transaction.get("reference"))
         or _env("TALLY_DEFAULT_PARTY_LEDGER", "Suspense")
     )
+
+
+def _selected_transaction_account(transaction):
+    account_name = (
+        _clean_text(transaction.get("account_name"))
+        or _clean_text(transaction.get("account"))
+        or _clean_text(transaction.get("party_ledger"))
+    )
+    if account_name:
+        return account_name
+
+    label = (
+        _clean_text(transaction.get("reference"))
+        or _clean_text(transaction.get("party_identifier"))
+        or _clean_text(transaction.get("party_name"))
+        or _clean_text(transaction.get("description"))
+        or "unknown transaction"
+    )
+    raise ValueError(f"Select an account for bank transaction '{label}' before posting to Tally.")
 
 
 def _is_cash_movement(transaction):
@@ -1541,3 +1662,33 @@ def _prefixed(label, value):
 
 def _xml(value):
     return escape(str(value), {'"': "&quot;"})
+
+
+def _parse_tally_xml(response_text):
+    try:
+        return ElementTree.fromstring(response_text)
+    except ElementTree.ParseError as error:
+        if "reference to invalid character number" not in str(error):
+            raise
+        return ElementTree.fromstring(_remove_invalid_xml_character_references(response_text))
+
+
+def _remove_invalid_xml_character_references(text):
+    return re.sub(r"&#(x[0-9a-fA-F]+|\d+);", _valid_xml_character_reference, text)
+
+
+def _valid_xml_character_reference(match):
+    raw_codepoint = match.group(1)
+    codepoint = int(raw_codepoint[1:], 16) if raw_codepoint.lower().startswith("x") else int(raw_codepoint)
+
+    if (
+        codepoint == 0x9
+        or codepoint == 0xA
+        or codepoint == 0xD
+        or 0x20 <= codepoint <= 0xD7FF
+        or 0xE000 <= codepoint <= 0xFFFD
+        or 0x10000 <= codepoint <= 0x10FFFF
+    ):
+        return match.group(0)
+
+    return ""

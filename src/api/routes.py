@@ -4,7 +4,13 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from services.extraction_service import SUPPORTED_DOCUMENT_TYPES, extract_document, infer_document_type
-from services.tally_service import list_tally_companies, post_to_tally
+from services.tally_service import (
+    create_tally_account,
+    list_tally_accounts,
+    list_tally_bank_accounts,
+    list_tally_companies,
+    post_to_tally,
+)
 
 
 router = APIRouter()
@@ -25,10 +31,49 @@ def tally_companies():
         raise HTTPException(status_code=500, detail=str(error)) from error
 
 
+@router.get("/tally/accounts")
+def tally_accounts(company_name: str | None = None):
+    try:
+        return list_tally_accounts(company_name)
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@router.get("/tally/bank-accounts")
+def tally_bank_accounts(company_name: str | None = None):
+    try:
+        return list_tally_bank_accounts(company_name)
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@router.post("/tally/accounts")
+async def tally_account(payload: dict):
+    try:
+        return create_tally_account(
+            payload.get("name"),
+            payload.get("parent") or "Sundry Creditors",
+            payload.get("company_name"),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
 @router.post("/extract")
 async def extract(
     file: UploadFile = File(...),
     document_type: str | None = Form(default=None),
+    heading_row: int | None = Form(default=None),
+    row_from: int | None = Form(default=None),
+    row_to: int | None = Form(default=None),
 ):
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_directory:
         file_path = Path(temporary_directory) / file.filename
@@ -39,8 +84,14 @@ async def extract(
         if selected_document_type not in SUPPORTED_DOCUMENT_TYPES:
             raise HTTPException(status_code=400, detail="Unsupported document type.")
 
+        row_options = _spreadsheet_row_options(heading_row, row_from, row_to)
+
         try:
-            return extract_document(file_path, document_type=selected_document_type)
+            return extract_document(
+                file_path,
+                document_type=selected_document_type,
+                row_options=row_options,
+            )
         except TimeoutError as error:
             raise HTTPException(
                 status_code=504,
@@ -62,3 +113,20 @@ async def post_voucher_to_tally(payload: dict):
         raise HTTPException(status_code=502, detail=str(error)) from error
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+def _spreadsheet_row_options(heading_row, row_from, row_to):
+    options = {
+        "heading_row": heading_row,
+        "row_from": row_from,
+        "row_to": row_to,
+    }
+
+    for label, value in options.items():
+        if value is not None and value < 1:
+            raise HTTPException(status_code=400, detail=f"{label} must be greater than zero.")
+
+    if row_from and row_to and row_from > row_to:
+        raise HTTPException(status_code=400, detail="row_from cannot be greater than row_to.")
+
+    return options

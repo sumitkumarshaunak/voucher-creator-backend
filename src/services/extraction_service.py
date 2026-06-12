@@ -11,7 +11,7 @@ def infer_document_type(file_path):
     return invoice_extractor.infer_document_type(file_path)
 
 
-def extract_document(file_path, document_type=None):
+def extract_document(file_path, document_type=None, row_options=None):
     selected_document_type = document_type or infer_document_type(file_path)
 
     if selected_document_type not in SUPPORTED_DOCUMENT_TYPES:
@@ -21,6 +21,7 @@ def extract_document(file_path, document_type=None):
         return bank_statement_extractor.extract_file(
             file_path,
             document_type=selected_document_type,
+            row_options=row_options,
         )
 
     if selected_document_type == "invoice":

@@ -161,7 +161,13 @@ def rows_to_csv(rows):
     return output.getvalue().strip()
 
 
-def _find_header_context(rows):
+def _find_header_context(rows, heading_row=None):
+    if heading_row:
+        for row_number, row in rows:
+            if row_number == heading_row:
+                return rows_to_csv([(row_number, row)])
+        return ""
+
     for row_number, row in rows[:50]:
         joined = " ".join(format_cell_value(value).lower() for value in row)
         if "date" in joined and any(
@@ -172,7 +178,7 @@ def _find_header_context(rows):
     return ""
 
 
-def excel_batches(file_path, rows_per_batch):
+def excel_batches(file_path, rows_per_batch, heading_row=None, row_from=None, row_to=None):
     batches = []
     for sheet_name, sheet_rows in _spreadsheet_rows(file_path):
         numbered_rows = [
@@ -180,9 +186,19 @@ def excel_batches(file_path, rows_per_batch):
             for row_number, row in enumerate(sheet_rows, start=1)
             if any(format_cell_value(value) for value in row)
         ]
-        header_context = _find_header_context(numbered_rows)
-        for start in range(0, len(numbered_rows), rows_per_batch):
-            chunk = numbered_rows[start : start + rows_per_batch]
+        header_context = _find_header_context(numbered_rows, heading_row=heading_row)
+        selected_row_from = row_from or ((heading_row + 1) if heading_row else None)
+        selected_rows = [
+            (row_number, row)
+            for row_number, row in numbered_rows
+            if (selected_row_from is None or row_number >= selected_row_from)
+            and (row_to is None or row_number <= row_to)
+        ]
+        if not selected_rows:
+            continue
+
+        for start in range(0, len(selected_rows), rows_per_batch):
+            chunk = selected_rows[start : start + rows_per_batch]
             batches.append(
                 {
                     "label": f"{sheet_name} rows {chunk[0][0]}-{chunk[-1][0]}",

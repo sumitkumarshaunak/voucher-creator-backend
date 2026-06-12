@@ -106,10 +106,17 @@ def _extract_batch(client, system_prompt, batch_label, content, header_context=N
     )
 
 
-def _extract_excel_file(client, system_prompt, file_path):
-    batches = excel_batches(file_path, rows_per_batch=EXCEL_ROWS_PER_BATCH)
+def _extract_excel_file(client, system_prompt, file_path, row_options=None):
+    row_options = row_options or {}
+    batches = excel_batches(
+        file_path,
+        rows_per_batch=EXCEL_ROWS_PER_BATCH,
+        heading_row=row_options.get("heading_row"),
+        row_from=row_options.get("row_from"),
+        row_to=row_options.get("row_to"),
+    )
     if not batches:
-        raise RuntimeError("Could not read any rows from the spreadsheet.")
+        raise RuntimeError("Could not read any rows from the selected spreadsheet range.")
 
     batch_jobs = [
         (
@@ -174,7 +181,7 @@ def _extract_pdf_file(client, system_prompt, file_path):
     return _merge_results(batch_results)
 
 
-def extract_file(file_path, document_type=None, api_key=None):
+def extract_file(file_path, document_type=None, api_key=None, row_options=None):
     if not file_path.exists():
         raise FileNotFoundError(f"File does not exist: {file_path}")
 
@@ -190,7 +197,7 @@ def extract_file(file_path, document_type=None, api_key=None):
     system_prompt = build_json_instructions(BANK_STATEMENT_SYSTEM_PROMPT, BANK_STATEMENT_DATA_SCHEMA)
 
     if suffix in SPREADSHEET_EXTENSIONS:
-        result = _extract_excel_file(client, system_prompt, file_path)
+        result = _extract_excel_file(client, system_prompt, file_path, row_options=row_options)
     else:
         result = _extract_pdf_file(client, system_prompt, file_path)
 
