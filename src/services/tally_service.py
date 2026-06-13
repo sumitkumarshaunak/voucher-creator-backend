@@ -68,6 +68,56 @@ def list_tally_bank_accounts(company_name=None):
         }
 
 
+def get_tally_account_totals(company_name=None, account_name=None, from_date=None, to_date=None, skip_voucher_types=None):
+    ledger_name = _clean_text(account_name)
+    if not ledger_name:
+        raise ValueError("Account name is required.")
+
+    tally_from_date = _tally_period_date(from_date, "from_date")
+    tally_to_date = _tally_period_date(to_date, "to_date")
+    skipped_voucher_types = _voucher_type_filter(skip_voucher_types)
+    if tally_from_date > tally_to_date:
+        raise ValueError("from_date cannot be after to_date.")
+
+    with _tally_company(_clean_text(company_name)):
+        ledgers = _fetch_ledgers([ledger_name])
+        ledger = ledgers.get(ledger_name)
+        if not ledger:
+            raise ValueError(f"Account '{ledger_name}' was not found in Tally.")
+
+        voucher_totals = _fetch_ledger_period_voucher_totals(
+            ledger_name,
+            tally_from_date,
+            tally_to_date,
+            skip_voucher_types=skipped_voucher_types,
+        )
+        debit_total = voucher_totals["debit_total"]
+        credit_total = voucher_totals["credit_total"]
+        opening_balance = _ledger_balance_before_date(ledger_name, ledger, tally_from_date)
+        closing_balance = round(opening_balance + debit_total - credit_total, 2)
+
+        return {
+            "accounts": [
+                {
+                    "name": ledger_name,
+                    "parent": ledger.get("parent") or "",
+                    "period_from": _display_tally_date(tally_from_date),
+                    "period_to": _display_tally_date(tally_to_date),
+                    "skipped_voucher_types": sorted(skipped_voucher_types),
+                    "opening_balance": opening_balance,
+                    "debit_total": debit_total,
+                    "credit_total": credit_total,
+                    "net_movement": round(debit_total - credit_total, 2),
+                    "closing_balance": closing_balance,
+                    "voucher_count": voucher_totals["voucher_count"],
+                    "skipped_out_of_period": voucher_totals["skipped_out_of_period"],
+                    "skipped_by_type": voucher_totals["skipped_by_type"],
+                    "vouchers": voucher_totals["vouchers"],
+                }
+            ]
+        }
+
+
 def create_tally_account(name, parent="Sundry Creditors", company_name=None):
     ledger_name = _clean_text(name)
     ledger_parent = _clean_text(parent) or "Sundry Creditors"
@@ -935,6 +985,227 @@ def _fetch_ledgers(ledger_names):
     return ledgers
 
 
+def _ledger_balance_before_date(ledger_name, ledger, tally_date):
+    financial_year_start = _financial_year_start(tally_date)
+    opening_balance = _ledger_opening_balance(ledger)
+
+    if tally_date <= financial_year_start:
+        return round(opening_balance, 2)
+
+    previous_date = _previous_tally_date(tally_date)
+    prior_totals = _fetch_ledger_period_voucher_totals(
+        ledger_name,
+        financial_year_start,
+        previous_date,
+        include_vouchers=False,
+    )
+    return round(opening_balance + prior_totals["debit_total"] - prior_totals["credit_total"], 2)
+
+
+def _ledger_opening_balance(ledger):
+    # Tally stores debit balances as negative amounts. The UI uses debit-positive balances.
+    return round(-_number(ledger.get("opening_balance")), 2)
+
+
+def _financial_year_start(tally_date):
+    parsed_date = datetime.strptime(tally_date, "%Y%m%d")
+    start_year = parsed_date.year if parsed_date.month >= 4 else parsed_date.year - 1
+    return datetime(start_year, 4, 1).strftime("%Y%m%d")
+
+
+def _previous_tally_date(tally_date):
+    from datetime import timedelta
+
+    parsed_date = datetime.strptime(tally_date, "%Y%m%d")
+    return (parsed_date - timedelta(days=1)).strftime("%Y%m%d")
+
+
+def _fetch_ledger_period_voucher_totals(
+    ledger_name,
+    from_date,
+    to_date,
+    include_vouchers=True,
+    skip_voucher_types=None,
+):
+    company_name = _company_name()
+    company_variable = (
+        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
+        if company_name
+        else ""
+    )
+    request_xml = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>PeriodVouchers</ID>"
+        "</HEADER>"
+        "<BODY>"
+        "<DESC>"
+        "<STATICVARIABLES>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"<SVFROMDATE>{_xml(from_date)}</SVFROMDATE>"
+        f"<SVTODATE>{_xml(to_date)}</SVTODATE>"
+        f"{company_variable}"
+        "</STATICVARIABLES>"
+        "<TDL>"
+        "<TDLMESSAGE>"
+        '<COLLECTION NAME="PeriodVouchers">'
+        "<TYPE>Voucher</TYPE>"
+        "<FETCH>Date,VoucherTypeName,VoucherNumber,Reference,ReferenceDate,PartyLedgerName,Narration,MasterId,AlterId,VoucherKey,AllLedgerEntries.LedgerName,AllLedgerEntries.Amount,AllLedgerEntries.IsDeemedPositive</FETCH>"
+        "<FILTERS>VoucherDateRange</FILTERS>"
+        "</COLLECTION>"
+        f'<SYSTEM TYPE="Formulae" NAME="VoucherDateRange">$Date &gt;= $$Date:"{_xml(from_date)}" AND $Date &lt;= $$Date:"{_xml(to_date)}"</SYSTEM>'
+        "</TDLMESSAGE>"
+        "</TDL>"
+        "</DESC>"
+        "</BODY>"
+        "</ENVELOPE>"
+    )
+
+    response_text = _post_xml_to_tally(request_xml)
+    root = _parse_tally_xml(response_text)
+    target_key = ledger_name.lower()
+    skipped_voucher_types = skip_voucher_types or set()
+    debit_total = 0.0
+    credit_total = 0.0
+    voucher_keys = set()
+    vouchers = []
+    skipped_out_of_period = 0
+    skipped_by_type = 0
+
+    for voucher_index, voucher in enumerate(root.findall(".//VOUCHER"), start=1):
+        voucher_date = _clean_text(voucher.findtext("DATE"))
+        if not _tally_date_in_range(voucher_date, from_date, to_date):
+            skipped_out_of_period += 1
+            continue
+        voucher_type = (voucher.findtext("VOUCHERTYPENAME") or "").strip()
+        if voucher_type.lower() in skipped_voucher_types:
+            skipped_by_type += 1
+            continue
+
+        voucher_key = (
+            voucher_type,
+            (voucher.findtext("VOUCHERNUMBER") or "").strip(),
+            voucher_date,
+            str(voucher_index),
+        )
+        selected_debit = 0.0
+        selected_credit = 0.0
+        ledger_entries = []
+
+        for entry in voucher.findall(".//ALLLEDGERENTRIES.LIST"):
+            entry_ledger = (entry.findtext("LEDGERNAME") or "").strip()
+            amount = _number(entry.findtext("AMOUNT"))
+            is_debit = _is_debit_tally_amount(amount, entry.findtext("ISDEEMEDPOSITIVE"))
+            entry_detail = {
+                "name": entry_ledger,
+                "amount": round(abs(amount), 2),
+                "direction": "debit" if is_debit else "credit",
+                "debit_amount": round(abs(amount), 2) if is_debit else 0,
+                "credit_amount": 0 if is_debit else round(abs(amount), 2),
+            }
+            ledger_entries.append(entry_detail)
+
+            if entry_ledger.lower() != target_key:
+                continue
+
+            if is_debit:
+                selected_debit += abs(amount)
+            else:
+                selected_credit += abs(amount)
+
+        if selected_debit or selected_credit:
+            voucher_keys.add(voucher_key)
+            debit_total += selected_debit
+            credit_total += selected_credit
+            if not include_vouchers:
+                continue
+            vouchers.append(
+                {
+                    "date": _display_tally_date(voucher.findtext("DATE")),
+                    "tally_date": voucher_date,
+                    "voucher_type": voucher_type,
+                    "voucher_number": (voucher.findtext("VOUCHERNUMBER") or "").strip(),
+                    "reference": (voucher.findtext("REFERENCE") or "").strip(),
+                    "reference_date": _display_tally_date(voucher.findtext("REFERENCEDATE")),
+                    "party_ledger": (voucher.findtext("PARTYLEDGERNAME") or "").strip(),
+                    "narration": (voucher.findtext("NARRATION") or "").strip(),
+                    "master_id": (voucher.findtext("MASTERID") or "").strip(),
+                    "alter_id": (voucher.findtext("ALTERID") or "").strip(),
+                    "voucher_key": (voucher.findtext("VOUCHERKEY") or "").strip(),
+                    "debit_amount": round(selected_debit, 2),
+                    "credit_amount": round(selected_credit, 2),
+                    "ledger_amount": round(max(selected_debit, selected_credit), 2),
+                    "direction": "debit" if selected_debit >= selected_credit else "credit",
+                    "opposite_ledgers": [
+                        entry_detail
+                        for entry_detail in ledger_entries
+                        if entry_detail["name"].lower() != target_key
+                    ],
+                    "ledger_entries": ledger_entries,
+                }
+            )
+
+    return {
+        "debit_total": round(debit_total, 2),
+        "credit_total": round(credit_total, 2),
+        "voucher_count": len(voucher_keys),
+        "skipped_out_of_period": skipped_out_of_period,
+        "skipped_by_type": skipped_by_type,
+        "vouchers": vouchers,
+    }
+
+
+def _fetch_ledger_balance(ledger_name, tally_date, balance_field):
+    company_name = _company_name()
+    company_variable = (
+        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
+        if company_name
+        else ""
+    )
+    request_xml = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>LedgerBalance</ID>"
+        "</HEADER>"
+        "<BODY>"
+        "<DESC>"
+        "<STATICVARIABLES>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"<SVFROMDATE>{_xml(tally_date)}</SVFROMDATE>"
+        f"<SVTODATE>{_xml(tally_date)}</SVTODATE>"
+        f"{company_variable}"
+        "</STATICVARIABLES>"
+        "<TDL>"
+        "<TDLMESSAGE>"
+        '<COLLECTION NAME="LedgerBalance">'
+        "<TYPE>Ledger</TYPE>"
+        "<FETCH>Name,OpeningBalance,ClosingBalance</FETCH>"
+        "<FILTERS>TargetLedger</FILTERS>"
+        "</COLLECTION>"
+        f'<SYSTEM TYPE="Formulae" NAME="TargetLedger">$Name = "{_xml(ledger_name)}"</SYSTEM>'
+        "</TDLMESSAGE>"
+        "</TDL>"
+        "</DESC>"
+        "</BODY>"
+        "</ENVELOPE>"
+    )
+
+    response_text = _post_xml_to_tally(request_xml)
+    root = _parse_tally_xml(response_text)
+    tag_name = balance_field.upper().replace(" ", "")
+    ledger = root.find(".//LEDGER")
+    if ledger is None:
+        return 0.0
+
+    return round(_number(ledger.findtext(tag_name)), 2)
+
+
 def _fetch_all_ledgers():
     company_name = _company_name()
     company_variable = (
@@ -1016,7 +1287,7 @@ def _fetch_ledgers_batch(ledger_names):
         "<TDLMESSAGE>"
         '<COLLECTION NAME="Ledgers">'
         "<TYPE>Ledger</TYPE>"
-        "<FETCH>Name,Parent</FETCH>"
+        "<FETCH>Name,Parent,OpeningBalance</FETCH>"
         "<FILTERS>TargetLedgers</FILTERS>"
         "</COLLECTION>"
         f'<SYSTEM TYPE="Formulae" NAME="TargetLedgers">{formula}</SYSTEM>'
@@ -1034,7 +1305,10 @@ def _fetch_ledgers_batch(ledger_names):
         name = (ledger.attrib.get("NAME") or "").strip()
         parent = ledger.findtext("PARENT") or ""
         if name:
-            spec = {"parent": parent.strip()}
+            spec = {
+                "parent": parent.strip(),
+                "opening_balance": (ledger.findtext("OPENINGBALANCE") or "").strip(),
+            }
             ledgers[name] = spec
             requested_name = requested_names_by_lower.get(name.lower())
             if requested_name:
@@ -1498,6 +1772,18 @@ def _clean_text(value):
     return str(value).strip()
 
 
+def _voucher_type_filter(value):
+    if value is None:
+        return set()
+
+    values = value if isinstance(value, list | tuple | set) else str(value).split(",")
+    return {
+        _clean_text(item).lower()
+        for item in values
+        if _clean_text(item)
+    }
+
+
 def _quantity_unit(quantity):
     text = _clean_text(quantity)
     if not text:
@@ -1636,6 +1922,84 @@ def _tally_date(value, field_name="date"):
     raise ValueError(f"{field_name} '{value}' is not a valid date. Use a date like 30-04-2026.")
 
 
+def _tally_period_date(value, field_name="date"):
+    if not value:
+        raise ValueError(f"{field_name} is required.")
+
+    text = str(value).strip()
+    normalized_text = (
+        text.replace(",", " ")
+        .replace("'", "")
+        .replace("Sept", "Sep")
+    )
+    normalized_text = re.sub(r"\s+", " ", normalized_text)
+    candidates = [
+        normalized_text,
+        normalized_text.split()[0],
+        normalized_text.replace(".", "-"),
+        normalized_text.replace("/", "-"),
+        normalized_text.replace(" ", "-"),
+    ]
+    formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%Y%m%d",
+        "%d-%m-%Y",
+        "%d-%m-%y",
+        "%d-%b-%Y",
+        "%d-%b-%y",
+        "%d-%B-%Y",
+        "%d-%B-%y",
+        "%d/%m/%Y",
+        "%d/%m/%y",
+        "%d/%b/%Y",
+        "%d/%b/%y",
+        "%d %m %Y",
+        "%d %m %y",
+        "%d %b %Y",
+        "%d %b %y",
+        "%d %B %Y",
+        "%d %B %y",
+    ]
+
+    for candidate in candidates:
+        for date_format in formats:
+            try:
+                return datetime.strptime(candidate, date_format).strftime("%Y%m%d")
+            except ValueError:
+                pass
+
+    raise ValueError(f"{field_name} '{value}' is not a valid date. Use a date like 2026-04-30.")
+
+
+def _display_tally_date(value):
+    text = _clean_text(value)
+    if not text:
+        return ""
+
+    try:
+        return datetime.strptime(text, "%Y%m%d").strftime("%Y-%m-%d")
+    except ValueError:
+        return text
+
+
+def _tally_date_in_range(value, from_date, to_date):
+    try:
+        tally_date = _tally_period_date(value, "voucher date")
+    except ValueError:
+        return False
+
+    return from_date <= tally_date <= to_date
+
+
+def _is_debit_tally_amount(amount, is_deemed_positive=None):
+    if amount < 0:
+        return True
+    if amount > 0:
+        return False
+    return _clean_text(is_deemed_positive).lower() == "yes"
+
+
 def _number(value):
     if value is None or value == "":
         return 0.0
@@ -1665,12 +2029,42 @@ def _xml(value):
 
 
 def _parse_tally_xml(response_text):
-    try:
-        return ElementTree.fromstring(response_text)
-    except ElementTree.ParseError as error:
-        if "reference to invalid character number" not in str(error):
-            raise
-        return ElementTree.fromstring(_remove_invalid_xml_character_references(response_text))
+    candidates = [
+        response_text,
+        _remove_invalid_xml_character_references(response_text),
+        _declare_missing_xml_prefixes(response_text),
+        _declare_missing_xml_prefixes(_remove_invalid_xml_character_references(response_text)),
+    ]
+    last_error = None
+
+    for candidate in candidates:
+        try:
+            return ElementTree.fromstring(candidate)
+        except ElementTree.ParseError as error:
+            last_error = error
+
+    raise last_error
+
+
+def _declare_missing_xml_prefixes(text):
+    used_prefixes = set(re.findall(r"</?([A-Za-z_][\w.-]*):[A-Za-z_][\w.-]*", text))
+    declared_prefixes = set(re.findall(r"\sxmlns:([A-Za-z_][\w.-]*)=", text))
+    missing_prefixes = sorted(prefix for prefix in used_prefixes - declared_prefixes if prefix.lower() != "xml")
+
+    if not missing_prefixes:
+        return text
+
+    namespace_attributes = "".join(
+        f' xmlns:{prefix}="urn:tally-unbound-prefix:{prefix}"'
+        for prefix in missing_prefixes
+    )
+
+    return re.sub(
+        r"(<[A-Za-z_][\w.-]*)(\s|>)",
+        rf"\1{namespace_attributes}\2",
+        text,
+        count=1,
+    )
 
 
 def _remove_invalid_xml_character_references(text):

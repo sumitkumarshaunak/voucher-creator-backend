@@ -6,6 +6,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from services.extraction_service import SUPPORTED_DOCUMENT_TYPES, extract_document, infer_document_type
 from services.tally_service import (
     create_tally_account,
+    get_tally_account_totals,
     list_tally_accounts,
     list_tally_bank_accounts,
     list_tally_companies,
@@ -45,6 +46,24 @@ def tally_accounts(company_name: str | None = None):
 def tally_bank_accounts(company_name: str | None = None):
     try:
         return list_tally_bank_accounts(company_name)
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@router.get("/tally/account-totals")
+def tally_account_totals(
+    company_name: str | None = None,
+    account_name: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    skip_voucher_types: str | None = None,
+):
+    try:
+        return get_tally_account_totals(company_name, account_name, from_date, to_date, skip_voucher_types)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     except Exception as error:
