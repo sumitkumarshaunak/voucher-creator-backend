@@ -578,7 +578,7 @@ def _line_item_charge_entries(invoice, is_debit):
             LedgerEntry(
                 ledger_name,
                 abs(amount),
-                is_debit if amount > 0 else not is_debit,
+                _charge_entry_is_debit(ledger_name, amount, is_debit),
                 entry_kind="charge",
             )
         )
@@ -602,7 +602,14 @@ def _invoice_charge_entries(invoice, is_debit):
             continue
         charge_key = _charge_key(line.get("line_type"), line.get("description"))
         ledger_name = _clean_text(charge_ledgers.get(f"line_{line_index}")) or _clean_text(charge_ledgers.get(charge_key)) or _charge_ledger(charge_key, line.get("description"))
-        entries.append(LedgerEntry(ledger_name, abs(amount), is_debit if amount > 0 else not is_debit))
+        entries.append(
+            LedgerEntry(
+                ledger_name,
+                abs(amount),
+                _charge_entry_is_debit(ledger_name, amount, is_debit),
+                entry_kind="charge",
+            )
+        )
 
     transport = invoice.get("transport") or invoice.get("transportation") or {}
     freight_amount = _number(transport.get("freight_amount"))
@@ -611,7 +618,11 @@ def _invoice_charge_entries(invoice, is_debit):
             LedgerEntry(
                 _clean_text(charge_ledgers.get("transport")) or _env("TALLY_FREIGHT_LEDGER", "Freight"),
                 abs(freight_amount),
-                is_debit if freight_amount > 0 else not is_debit,
+                _charge_entry_is_debit(
+                    _clean_text(charge_ledgers.get("transport")) or _env("TALLY_FREIGHT_LEDGER", "Freight"),
+                    freight_amount,
+                    is_debit,
+                ),
                 entry_kind="transport",
             )
         )
@@ -621,7 +632,11 @@ def _invoice_charge_entries(invoice, is_debit):
             LedgerEntry(
                 _clean_text(charge_ledgers.get("round_off")) or _env("TALLY_ROUND_OFF_LEDGER", "Round Off"),
                 abs(round_off_amount),
-                is_debit if round_off_amount > 0 else not is_debit,
+                _charge_entry_is_debit(
+                    _clean_text(charge_ledgers.get("round_off")) or _env("TALLY_ROUND_OFF_LEDGER", "Round Off"),
+                    round_off_amount,
+                    is_debit,
+                ),
                 entry_kind="round_off",
             )
         )
@@ -656,6 +671,26 @@ def _charge_ledger(line_type, description):
         return _env("TALLY_INSURANCE_LEDGER", "Insurance")
 
     return _env("TALLY_OTHER_CHARGES_LEDGER", "Other Charges")
+
+
+def _charge_entry_is_debit(ledger_name, amount, fallback_is_debit):
+    posts_as_debit = fallback_is_debit
+    parent = _fetch_ledger_parent(ledger_name).lower()
+
+    if "expense" in parent or "purchase" in parent:
+        posts_as_debit = True
+    elif "income" in parent or "sales" in parent or "duties" in parent or "tax" in parent:
+        posts_as_debit = False
+
+    return posts_as_debit if amount >= 0 else not posts_as_debit
+
+
+def _fetch_ledger_parent(ledger_name):
+    cleaned_name = _clean_text(ledger_name)
+    if not cleaned_name:
+        return ""
+
+    return (_fetch_ledgers([cleaned_name]).get(cleaned_name) or {}).get("parent", "")
 
 
 def _ensure_tally_masters(vouchers, allow_create=True):
@@ -728,22 +763,7 @@ def _ensure_tally_masters(vouchers, allow_create=True):
 
 
 def _validate_round_off_ledgers(voucher, ledgers):
-    for entry in voucher.get("entries") or []:
-        if getattr(entry, "entry_kind", "") != "round_off":
-            continue
-
-        parent = (ledgers.get(entry.ledger_name) or {}).get("parent", "")
-        parent_key = parent.lower()
-        if entry.is_debit and "income" in parent_key:
-            raise ValueError(
-                f"Round-off ledger '{entry.ledger_name}' is under '{parent}', but this round-off posts as Debit. "
-                "Select an Expense ledger for debit round-off."
-            )
-        if not entry.is_debit and "expense" in parent_key:
-            raise ValueError(
-                f"Round-off ledger '{entry.ledger_name}' is under '{parent}', but this round-off posts as Credit. "
-                "Select an Income ledger for credit round-off."
-            )
+    return
 
 
 def _ledger_specs_for_vouchers(vouchers):
