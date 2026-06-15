@@ -172,8 +172,21 @@ def _post_to_tally(document_type, source, data):
         raise ValueError("No vouchers found to post to Tally.")
 
     _ensure_tally_company()
-    unique_vouchers, duplicate_count = _unique_vouchers(vouchers)
-    existing_voucher_keys = _fetch_existing_voucher_keys(unique_vouchers)
+    if document_type == "bank_statement":
+        duplicate_bank_voucher_numbers = _duplicate_bank_voucher_numbers(vouchers)
+        if duplicate_bank_voucher_numbers:
+            raise ValueError(_duplicate_bank_voucher_message(duplicate_bank_voucher_numbers))
+
+        unique_vouchers = vouchers
+        duplicate_count = 0
+        existing_bank_voucher_numbers = _fetch_existing_voucher_numbers(unique_vouchers)
+        if existing_bank_voucher_numbers:
+            raise ValueError(_existing_bank_voucher_message(existing_bank_voucher_numbers))
+        existing_voucher_keys = set()
+    else:
+        unique_vouchers, duplicate_count = _unique_vouchers(vouchers)
+        existing_voucher_keys = _fetch_existing_voucher_keys(unique_vouchers)
+
     vouchers_to_post = [
         voucher
         for voucher in unique_vouchers
@@ -274,16 +287,11 @@ def _chunks(items, size):
         yield items[start : start + size]
 
 
-def _bank_voucher_number(statement, transaction, tally_date, amount, direction, bank_ledger):
-    parts = [
-        bank_ledger,
-        statement.get("account_number") or "NoAccount",
-        tally_date,
-        transaction.get("reference") or "NoRef",
-        direction,
-        f"{amount:.2f}",
-    ]
-    return "/".join(_voucher_number_part(part) for part in parts)
+def _bank_voucher_number(transaction):
+    reference = _clean_text(transaction.get("reference"))
+    if not reference:
+        raise ValueError("Bank transaction reference is required because it is used as the Tally voucher number.")
+    return _voucher_number_part(reference)
 
 
 def _voucher_number_part(value):
@@ -308,6 +316,48 @@ def _unique_vouchers(vouchers):
     return unique_vouchers, duplicate_count
 
 
+def _duplicate_bank_voucher_numbers(vouchers):
+    seen_numbers = set()
+    duplicate_numbers = set()
+
+    for voucher in vouchers:
+        voucher_number = _clean_text(voucher.get("voucher_number"))
+        if not voucher_number:
+            continue
+        if voucher_number in seen_numbers:
+            duplicate_numbers.add(voucher_number)
+            continue
+        seen_numbers.add(voucher_number)
+
+    return duplicate_numbers
+
+
+def _duplicate_bank_voucher_message(voucher_numbers):
+    return _bank_voucher_number_message(
+        voucher_numbers,
+        "Cannot post bank statement because duplicate transaction references were found",
+    )
+
+
+def _existing_bank_voucher_message(voucher_numbers):
+    return _bank_voucher_number_message(
+        voucher_numbers,
+        "Cannot post bank statement because transaction references are already posted in Tally",
+    )
+
+
+def _bank_voucher_number_message(voucher_numbers, prefix):
+    unique_numbers = sorted(set(voucher_numbers))
+    preview = ", ".join(unique_numbers[:5]) or "unknown"
+    extra_count = max(0, len(unique_numbers) - 5)
+    extra_text = f" and {extra_count} more" if extra_count > 0 else ""
+
+    return (
+        f"{prefix}: {preview}{extra_text}. "
+        "Remove those transaction(s) or change the reference before posting."
+    )
+
+
 def _bank_statement_vouchers(statement):
     bank_ledger = _bank_ledger(statement)
     transactions = statement.get("transactions") or []
@@ -319,6 +369,7 @@ def _bank_statement_vouchers(statement):
             continue
 
         direction = str(transaction.get("direction") or "").lower()
+        voucher_number = _bank_voucher_number(transaction)
         party_ledger = _selected_transaction_account(transaction)
         date = _tally_date(transaction.get("value_date") or transaction.get("txn_date"), field_name="transaction date")
         narration = _join_narration(
@@ -353,7 +404,7 @@ def _bank_statement_vouchers(statement):
             {
                 "date": date,
                 "voucher_type": voucher_type,
-                "voucher_number": _bank_voucher_number(statement, transaction, date, amount, direction, bank_ledger),
+                "voucher_number": voucher_number,
                 "party_ledger": party_ledger,
                 "narration": narration,
                 "entries": entries,
@@ -1655,6 +1706,73 @@ def _fetch_existing_voucher_keys(vouchers):
         existing_keys.update(_fetch_existing_voucher_keys_batch(batch))
 
     return existing_keys
+
+
+def _fetch_existing_voucher_numbers(vouchers):
+    voucher_numbers = {
+        _clean_text(voucher.get("voucher_number"))
+        for voucher in vouchers
+        if _clean_text(voucher.get("voucher_number"))
+    }
+    if not voucher_numbers:
+        return set()
+
+    existing_numbers = set()
+    for batch in _chunks(sorted(voucher_numbers), _tally_lookup_batch_size()):
+        existing_numbers.update(_fetch_existing_voucher_numbers_batch(batch))
+
+    return existing_numbers
+
+
+def _fetch_existing_voucher_numbers_batch(voucher_numbers):
+    filters = " OR ".join(
+        f'($VoucherNumber = "{_xml(voucher_number)}")'
+        for voucher_number in voucher_numbers
+    )
+    company_name = _company_name()
+    company_variable = (
+        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
+        if company_name
+        else ""
+    )
+    request_xml = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>ExistingVoucherNumbers</ID>"
+        "</HEADER>"
+        "<BODY>"
+        "<DESC>"
+        "<STATICVARIABLES>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"{company_variable}"
+        "</STATICVARIABLES>"
+        "<TDL>"
+        "<TDLMESSAGE>"
+        '<COLLECTION NAME="ExistingVoucherNumbers">'
+        "<TYPE>Voucher</TYPE>"
+        "<FETCH>VoucherNumber</FETCH>"
+        "<FILTERS>TargetVoucherNumbers</FILTERS>"
+        "</COLLECTION>"
+        f'<SYSTEM TYPE="Formulae" NAME="TargetVoucherNumbers">{filters}</SYSTEM>'
+        "</TDLMESSAGE>"
+        "</TDL>"
+        "</DESC>"
+        "</BODY>"
+        "</ENVELOPE>"
+    )
+
+    response_text = _post_xml_to_tally(request_xml)
+    root = _parse_tally_xml(response_text)
+    existing_numbers = set()
+    for voucher in root.findall(".//VOUCHER"):
+        voucher_number = (voucher.findtext("VOUCHERNUMBER") or "").strip()
+        if voucher_number:
+            existing_numbers.add(voucher_number)
+
+    return existing_numbers
 
 
 def _fetch_existing_voucher_keys_batch(voucher_keys):

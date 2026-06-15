@@ -370,14 +370,15 @@ collapse runs of spaces and trim each token.
   (UPI / NEFT / RTGS / IMPS).
 ---
 ### `reference` — one most-specific reference number
-Priority: **UTR → UPI ref → IMPS ref → cheque number → otherwise null.**
-- **UTR** (NEFT/RTGS): alphanumeric transaction ref, e.g. `IDIBN52026060845355526`,
-  `ICICR42026050100502895`. It sits right after the rail keyword.
-- **UPI ref**: numeric ID right after `UPI/`, e.g. `109722460725` from
-  `UPI/109722460725/...`. Digits only — no prefix, slashes, name, or date.
-- **IMPS ref**: numeric after `IMPS/`, e.g. `612557523735` from `MMT/IMPS/612557523735/...`.
-- **Cheque number**: e.g. `918178` from `INWARD CHQ 00918178 ...` or the dedicated cheque column.
-- Do NOT use the bank's internal `tran_id` (e.g. `S80780973`) as `reference`.
+Priority: **valid `Chq./Ref.No.` → EMI/DPI mandate from narration → null.**
+- Use `Chq./Ref.No.` as-is when present and not all zeros / placeholders (`************`).
+  It may be a UTR, UPI/IMPS numeric ref, cheque no., or other bank ref.
+- If `Chq./Ref.No.` is null/all zeros, parse EMI/DPI narration/description for a mandate reference:
+  `EMI|DPI {policy_no} CHQ {mandate_no} {batch_ref}` → use the `S`-prefixed
+  `{mandate_no}`, e.g. `EMI 89586928 CHQ S895869280281 052689586928` →
+  `S895869280281`.
+- Do NOT use bank internal `tran_id`, all-zero strings, EMI/DPI policy number, or
+  `0526...` batch ref as `reference`.
 ---
 ### `party_name` — human-readable counterparty
 > ⚠️ **Two hard overrides — apply before anything else:**
@@ -558,6 +559,7 @@ BANK_STATEMENT_DATA_SCHEMA = {
                     },
                     "reference": {
                         "type": ["string", "null"],
+                        "description": "Use valid Chq./Ref.No. as-is; if null/all-zero, extract EMI/DPI S-prefixed mandate from narration. Never use tran_id, all-zero placeholders, policy no., or 0526 batch ref.",
                     },
                     "party_name": {
                         "type": ["string", "null"],
