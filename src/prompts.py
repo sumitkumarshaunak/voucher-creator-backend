@@ -1,622 +1,294 @@
-INVOICE_DATA_SCHEMA={
+INVOICE_DATA_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "TallyVoucher",
+    "description": "Minimal schema to extract GST tax invoice data and post a Purchase or Sales voucher.",
     "type": "object",
+    "required": [
+        "voucher_type",
+        "invoice_no",
+        "invoice_date",
+        "supplier",
+        "buyer",
+        "line_items",
+        "totals"
+    ],
+    "additionalProperties": False,
+
     "properties": {
-        "document_type": {
-            "description": "Tax Invoice, GST Invoice, E-Invoice, E-Way Bill, LR, Bilty, Delivery Challan, etc.",
-            "anyOf": [{
-                "type": "string"
-            }, {
-                "type": "null"
-            }]
+
+        "voucher_type": {
+            "type": "string",
+            "enum": ["Purchase", "Sales"],
+            "description": (
+                "Tally VOUCHERTYPENAME. "
+                "Determined by which party is SHUBHAM STEEL & FERTILIZERS PRIVATE LTD (GSTIN prefix 06ABMCS5444E or 08ABMCS5444E): "
+                "if Shubham Steel is the SUPPLIER (issuer/seller) → 'Sales'. "
+                "If Shubham Steel is the BUYER (bill-to / consignee) → 'Purchase'. "
+                "When Shubham Steel does not appear on the invoice, "
+                "use context: 'Purchase' if the company whose books are being posted is the buyer, 'Sales' if it is the seller."
+            )
         },
+
         "invoice_no": {
-            "anyOf": [{
-                "type": "string"
-            }, {
-                "type": "null"
-            }]
+            "type": "string",
+            "description": "Supplier's invoice number exactly as printed. Used as Tally bill reference."
         },
+
         "invoice_date": {
-            "anyOf": [{
-                "type": "string"
-            }, {
-                "type": "null"
-            }]
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "description": "YYYY-MM-DD. Common printed formats: '30-04-2026', '30-Apr-26', '30/04/2026', '30.04.2026'."
         },
-        "seller": {
-            "description": "Business entity participating in the transaction.",
+
+        "supplier": {
             "type": "object",
-            "properties": {
-                "name": {
-                    "description": "Legal or trade name of the party.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "gstin": {
-                    "description": "GSTIN exactly as printed.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "pan": {
-                    "description": "PAN exactly as printed.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                }
-            },
+            "description": "Seller / issuer of the invoice.",
             "required": ["name", "gstin", "pan"],
-            "additionalProperties": False
+            "additionalProperties": False,
+            "properties": {
+                "name":  {"type": "string", "description": "Legal name as printed on invoice."},
+                "gstin": {"type": "string", "pattern": "^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$"},
+                "pan":   {"type": ["string", "null"]}
+            }
         },
+
         "buyer": {
-            "description": "Business entity participating in the transaction.",
             "type": "object",
-            "properties": {
-                "name": {
-                    "description": "Legal or trade name of the party.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "gstin": {
-                    "description": "GSTIN exactly as printed.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "pan": {
-                    "description": "PAN exactly as printed.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                }
-            },
+            "description": "Purchaser / bill-to party.",
             "required": ["name", "gstin", "pan"],
-            "additionalProperties": False
-        },
-        "irn": {
-            "anyOf": [{
-                "type": "string"
-            }, {
-                "type": "null"
-            }]
-        },
-        "ack_no": {
-            "anyOf": [{
-                "type": "string"
-            }, {
-                "type": "null"
-            }]
-        },
-        "ack_date": {
-            "anyOf": [{
-                "type": "string"
-            }, {
-                "type": "null"
-            }]
-        },
-        "transportation": {
-            "description": "Transportation and logistics details.",
-            "type": "object",
+            "additionalProperties": False,
             "properties": {
-                "eway_bill_no": {
-                    "description": "E-Way Bill number.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "vehicle_no": {
-                    "description": "Vehicle registration number.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "transporter_name": {
-                    "description": "Transporter or logistics company name.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "transporter_gstin": {
-                    "description": "GSTIN of transporter.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "lr_no": {
-                    "description": "LR, GR, Bilty, Consignment, or Lorry Receipt number.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "from_location": {
-                    "description": "Origin or dispatch location.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "to_location": {
-                    "description": "Destination location.",
-                    "anyOf": [{
-                        "type": "string"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "transportation_cost": {
-                    "description": "Cost of transportation or freight charges.",
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
+                "name":  {"type": "string"},
+                "gstin": {"type": "string", "pattern": "^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$"},
+                "pan":   {"type": ["string", "null"]}
+            }
+        },
+
+        "line_items": {
+            "type": "array",
+            "minItems": 1,
+            "description": "One entry per printed invoice row. Maps to Tally INVENTORYENTRIES.LIST.",
+            "items": {
+                "type": "object",
+                "required": ["sl_no", "description", "hsn", "qty", "unit", "rate", "taxable_amount", "gst_rate"],
+                "additionalProperties": False,
+                "properties": {
+                    "sl_no":          {"type": "integer", "minimum": 1},
+                    "description":    {"type": "string", "description": "Item description as printed."},
+                    "hsn":            {"type": "string", "description": "HSN code for goods, SAC for services."},
+                    "qty":            {"type": ["number", "null"]},
+                    "unit":           {"type": ["string", "null"], "description": "e.g. MT, KG, NOS."},
+                    "rate":           {"type": ["number", "null"], "description": "Price per unit before tax."},
+                    "taxable_amount": {
+                        "type": "number",
+                        "description": (
+                            "Pre-tax subtotal for this line = qty × rate minus any discount. "
+                            "IMPORTANT: Many invoice formats show a combined Amount() column that includes tax — "
+                            "do NOT use that column as taxable_amount. "
+                            "The taxable_amount is always the value BEFORE GST is added. "
+                            "Verify: taxable_amount × (1 + gst_rate/100) ≈ line_total."
+                        )
+                    },
+                    "discount_amount": {"type": "number", "default": 0},
+                    "gst_rate":        {"type": "number", "description": "Total GST % e.g. 18."},
+                    "igst_amount":     {"type": "number", "default": 0, "description": "0 if intra-state."},
+                    "cgst_amount":     {"type": "number", "default": 0, "description": "0 if inter-state."},
+                    "sgst_amount":     {"type": "number", "default": 0, "description": "0 if inter-state."},
+                    "cess_amount":     {"type": "number", "default": 0},
+                    "line_total":      {
+                        "type": "number",
+                        "description": (
+                            "taxable_amount + igst_amount + cgst_amount + sgst_amount + cess_amount for this line. "
+                            "Copy directly from the printed Amount() column if available, preserving all decimal places. "
+                            "Rounding off is applied at the invoice level, not per line."
+                        )
+                    }
                 }
-            },
-            "required": ["eway_bill_no", "vehicle_no", "transporter_name", "transporter_gstin", "lr_no", "from_location", "to_location", "transportation_cost"],
-            "additionalProperties": False
-        },
-        "items": {
-            "type": "array",
-            "items": {
-                "description": "Primary billable product or service.",
-                "type": "object",
-                "properties": {
-                    "description": {
-                        "description": "Product or service description.",
-                        "anyOf": [{
-                            "type": "string"
-                        }, {
-                            "type": "null"
-                        }]
-                    },
-                    "hsn_code": {
-                        "description": "HSN or SAC code.",
-                        "anyOf": [{
-                            "type": "string"
-                        }, {
-                            "type": "null"
-                        }]
-                    },
-                    "quantity": {
-                        "description": "Quantity exactly as shown including units. Example: '43.960 MTs', '4 BARREL'.",
-                        "anyOf": [{
-                            "type": "string"
-                        }, {
-                            "type": "null"
-                        }]
-                    },
-                    "rate": {
-                        "description": "Unit rate or unit price.",
-                        "anyOf": [{
-                            "type": "number"
-                        }, {
-                            "type": "null"
-                        }]
-                    },
-                    "line_total": {
-                        "description": "Total amount for the line item (quantity x rate).",
-                        "anyOf": [{
-                            "type": "number"
-                        }, {
-                            "type": "null"
-                        }]
-                    }
-                },
-                "required": ["description", "hsn_code", "quantity", "rate", "line_total"],
-                "additionalProperties": False
             }
         },
-        "additional_items": {
-            "description": "Invoice-level charges such as taxes, discounts, insurance, packing, and round-off. Excludes freight and transportation cost. Round-off must use line_type 'round_off' and must never be classified as 'other'.",
+
+        "other_charges": {
             "type": "array",
+            "description": (
+                "Invoice-level charges listed as separate line items (e.g. Freight, Material Insurance, Packing). "
+                "Include only if explicitly printed on the invoice and included in the invoice totals. "
+                "Do not invent charges not shown."
+            ),
             "items": {
-                "description": "Monetary line associated with an item or the invoice.",
                 "type": "object",
+                "required": ["description", "amount"],
+                "additionalProperties": False,
                 "properties": {
-                    "line_type": {
-                        "description": "Classification of the line.",
-                        "anyOf": [{
-                            "type": "string"
-                        }, {
-                            "type": "null"
-                        }]
-                    },
-                    "description": {
-                        "description": "Description of charge, tax, discount, or adjustment.",
-                        "anyOf": [{
-                            "type": "string"
-                        }, {
-                            "type": "null"
-                        }]
-                    },
-                    "rate": {
-                        "description": "Percentage or rate explicitly shown.",
-                        "anyOf": [{
-                            "type": "number"
-                        }, {
-                            "type": "null"
-                        }]
-                    },
-                    "amount": {
-                        "description": "Amount associated with the line.",
-                        "anyOf": [{
-                            "type": "number"
-                        }, {
-                            "type": "null"
-                        }]
-                    }
-                },
-                "required": ["line_type", "description", "rate", "amount"],
-                "additionalProperties": False
+                    "description": {"type": "string"},
+                    "hsn":         {"type": "string"},
+                    "amount":      {"type": "number"},
+                    "gst_rate":    {"type": "number", "default": 0},
+                    "igst_amount": {"type": "number", "default": 0},
+                    "cgst_amount": {"type": "number", "default": 0},
+                    "sgst_amount": {"type": "number", "default": 0}
+                }
             }
         },
+
         "totals": {
-            "description": "Invoice totals.",
             "type": "object",
+            "description": "Invoice footer totals. All values must match the printed document exactly.",
+            "required": ["taxable_value", "grand_total"],
+            "additionalProperties": False,
             "properties": {
-                "taxable_amount": {
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
+                "taxable_value":       {"type": "number"},
+                "total_igst":          {"type": "number", "default": 0},
+                "total_cgst":          {"type": "number", "default": 0},
+                "total_sgst":          {"type": "number", "default": 0},
+                "total_cess":          {"type": "number", "default": 0},
+                "total_other_charges": {"type": "number", "default": 0},
+                "rounding_off":        {
+                    "type": "number",
+                    "default": 0,
+                    "description": (
+                        "Signed rounding adjustment as printed. "
+                        "Positive (Add: Rounded Off (+)) means added to total. "
+                        "Negative (Less: Rounded Off (-)) means deducted."
+                    )
                 },
-                "cgst_amount": {
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
+                "grand_total":     {
+                    "type": "number",
+                    "description": (
+                        "Copy the Grand Total / Amount Chargeable exactly as printed — do not recompute. "
+                        "Indian number format: 12,57,109 = 1257109. "
+                        "Always verify against the amount-in-words field as a cross-check."
+                    )
                 },
-                "sgst_amount": {
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
+                "amount_in_words": {"type": "string"}
+            }
+        },
+
+        "transport": {
+            "type": "object",
+            "description": "Logistics details from the invoice and/or accompanying e-Way Bill / LR.",
+            "additionalProperties": False,
+            "properties": {
+                "transporter":    {"type": "string"},
+                "vehicle_no":     {"type": "string"},
+                "lr_no":          {"type": ["string", "null"]},
+                "lr_date":        {"type": ["string", "null"], "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                "from":           {"type": "string"},
+                "to":             {"type": ["string", "null"]},
+                "freight_terms":  {
+                    "type": "string",
+                    "enum": ["Prepaid", "To Pay", "FOB", "Paid"],
+                    "description": "Who bears freight cost. Default 'To Pay' if not stated."
                 },
-                "igst_amount": {
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "cess_amount": {
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "other_charges": {
-                    "description": "Other charges included in the invoice total, excluding taxes, transportation cost, and round-off. Examples: insurance, packing charges, loading/unloading charges.",
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "total_tax_amount": {
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "round_off_amount": {
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
-                },
-                "grand_total": {
-                    "anyOf": [{
-                        "type": "number"
-                    }, {
-                        "type": "null"
-                    }]
+                "freight_amount": {
+                    "type": "number",
+                    "description": (
+                        "Freight amount as stated on the LR/bilty, if a separate LR document is present. "
+                        "Set to 0 if no LR freight amount is explicitly printed. "
+                        "Do NOT use the invoice grand total as the freight amount."
+                    )
                 }
-            },
-            "required": ["taxable_amount", "cgst_amount", "sgst_amount", "igst_amount", "cess_amount", "other_charges", "total_tax_amount", "round_off_amount", "grand_total", "transportation_cost"],
-            "additionalProperties": False
+            }
         }
-    },
-    "required": ["document_type", "invoice_no", "invoice_date", "seller", "buyer", "irn", "ack_no", "ack_date", "transportation", "items", "additional_items", "totals"],
-    "additionalProperties": False
+    }
 }
 
-INVOICE_SYSTEM_PROMPT= """"
-You are an expert invoice, tax, logistics, and commercial document extraction system.
 
-# Objective
+INVOICE_SYSTEM_PROMPT = """
+You are a GST invoice data extraction specialist for an Indian steel trading company.
 
-Extract structured business information from invoices, GST invoices, e-invoices, commercial invoices, delivery challans, e-way bills, transport receipts (LR/GR/Bilty), and related logistics documents.
-
-Return data strictly matching the provided schema.
-
----
-
-# Core Rules
-
-1. Extract only information explicitly present in the document.
-2. Never guess, infer, derive, calculate, estimate, or hallucinate values.
-3. Use null when a value cannot be confidently identified.
-4. Preserve identifiers exactly as printed.
-5. Preserve numeric values exactly as shown.
-6. Do not modify GSTINs, PANs, invoice numbers, IRNs, vehicle numbers, e-way bill numbers, account numbers, or HSN/SAC codes.
-7. Do not create fields not defined in the schema.
-8. Ignore OCR artifacts and formatting issues.
+Your task: read the markup of one or more invoice pages and output a single JSON object
+that strictly follows the provided schema. The JSON will be consumed by a program that posts a
+voucher to TallyPrime via XML import — accuracy is critical.
 
 ---
 
-# Source Priority
+## EXTRACTION RULES
 
-If the same field appears multiple times, use the first available value from:
+### 1  Identify the document type
+- If the input contains multiple page types (Tax Invoice + e-Way Bill + LR / Consignment Note),
+  treat the **Tax Invoice** as the primary source.
+- Extract supporting logistics fields (vehicle_no, lr_no, eway_bill_no) from the other pages.
+- Ignore pages that are only an e-Way Bill or LR with no invoice data.
 
-1. Invoice / Tax Invoice
-2. E-Invoice
-3. E-Way Bill
-4. LR / GR / Bilty
-5. Other Logistics Documents
+### 2  `voucher_type` — read carefully
+- Identify which party is **SHUBHAM STEEL & FERTILIZERS PRIVATE LTD** (GSTIN contains ABMCS5444E).
+- If Shubham Steel is the **issuer / supplier** (top of invoice, "Tax Invoice" header) → `"Sales"`.
+- If Shubham Steel is the **buyer / bill-to / consignee** → `"Purchase"`.
+- This is the most commonly mis-extracted field — verify before outputting.
 
-Do not overwrite higher-priority values with lower-priority values.
+### 3  Dates
+- Always output as `YYYY-MM-DD`.
+- Common formats on Indian invoices: `30-04-2026`, `30-Apr-26`, `30/04/2026`, `30.04.2026`
+  → all map to `"2026-04-30"`.
 
----
+### 4  GST supply type (inter-state vs intra-state)
+- Compare the first 2 digits of supplier GSTIN vs buyer GSTIN.
+- Different state codes → **Inter-State** → only `igst_amount` non-zero per line.
+- Same state codes → **Intra-State** → only `cgst_amount` and `sgst_amount` non-zero per line.
+  Each is half the total GST rate (e.g. 18% GST = 9% CGST + 9% SGST).
 
-# Party Extraction
+### 5  `taxable_amount` per line — most common extraction error
+Indian invoices have two common column layouts:
 
-Extract only entity names.
+  **Layout A** — separate tax columns (common):
+  | Description | HSN | Qty | Rate | Taxable Amt | IGST Rate | IGST Amt | Total |
+  → `taxable_amount` = the "Taxable Amt" column (pre-tax).
+  → `line_total` = the "Total" / "Amount()" column (taxable + taxes).
 
-Do not include:
+  **Layout B** — combined Amount column (Amount already includes tax):
+  | Description | HSN | Qty | Rate | IGST Rate | IGST Amt | Amount() |
+  → The "Amount()" column is `line_total` (taxable + tax combined).
+  → `taxable_amount` = Amount() ÷ (1 + gst_rate/100), OR back-calculate from IGST:
+    taxable_amount = igst_amount ÷ (gst_rate/100).
+  → NEVER assign the combined Amount() value to `taxable_amount`.
 
-* Addresses
-* GSTINs
-* PANs
-* CINs
-* Registration Numbers
-* Bank Details
-* Notes
+  **Cross-check rule**: taxable_amount × (1 + gst_rate/100) must equal line_total (within ₹1).
+  If it doesn't, you have the wrong column — recalculate.
 
-Examples:
+### 6  Amounts — copy exactly, do not recompute
+- All amounts are plain numbers (no ₹ symbol, no commas).
+- Copy values **exactly as printed** — do not recalculate or round.
+- Indian number format: 12,57,109 = 1257109 | 1,88,0529 = 1880529 | 22,19,024.22 = 2219024.22
+  Preserve all decimal places (e.g. 2219024.22, not 2219024).
+- `rounding_off`: positive if labelled "Add: Rounded Off (+)", negative if "Less: Rounded Off (-)".
+- `grand_total`: copy the printed "Grand Total" / "Amount Chargeable" exactly.
+  Cross-check: grand_total amount-in-words must match the numeric grand_total.
+  If they conflict, trust the amount-in-words (OCR misreads digits more often than words).
 
-Correct:
+### 7  `line_total` per line
+- Copy directly from the printed row total column (often labelled "Amount()" or "Total").
+- Preserve all decimals as printed (e.g. 22,19,024.22 → 2219024.22).
+- Rounding off is an invoice-level adjustment, not per-line. Do not add rounding to line_total.
 
-Seller Name:
-ANJANISUTA STEELS PRIVATE LIMITED
+### 8  `other_charges`
+- Only include if the invoice explicitly lists additional charges as separate named line items
+  (e.g. "Material Insurance", "Freight Charges", "Packing").
+- Do not invent charges. Do not move line-item charges into this array.
+- If a charge is already captured in `line_items`, do not duplicate it here.
 
-Incorrect:
-
-Seller Name:
-ANJANISUTA STEELS PRIVATE LIMITED, GSTIN 20AATCA2149Q1ZA
-
----
-
-# Transportation Extraction
-
-Extract when available:
-
-* eway_bill_no
-* vehicle_no
-* transporter_name
-* transporter_gstin
-* lr_no
-* from_location
-* to_location
-
-Use null if not explicitly present.
-
----
-
-# Item Identification
-
-A product item is a primary billable good or service.
-
-Examples:
-
-* Steel
-* Lubricants
-* Chemicals
-* Machinery
-* Services
-
-Do not classify the following as products:
-
-* Taxes
-* Freight rows
-* Insurance rows
-* Packing charges
-* Discounts
-* Round-off rows
-* Summary rows
-* Total rows
+### 9  `transport`
+- `vehicle_no`, `lr_no`: extract from the Tax Invoice header first; supplement from e-Way Bill / LR.
+- `freight_amount`: the freight amount printed on the LR/bilty document, if present.
+  Set to 0 if no LR is attached or no freight amount is explicitly stated.
+  **Do NOT use the invoice grand total as freight_amount.**
+- `freight_terms`: look for "To Pay", "Prepaid", "Paid", "FOB" on the LR or invoice.
+  Default `"To Pay"` if not found.
 
 ---
 
-# Line Classification
+## OUTPUT RULES
 
-Every monetary row should be classified into one of the following line types:
-
-* product
-* freight
-* insurance
-* packing
-* loading
-* unloading
-* handling
-* transportation
-* discount
-* cgst
-* sgst
-* igst
-* cess
-* other_tax
-* round_off
-* other
-
-Use the most specific type available.
-
----
-
-# Item Lines
-
-Attach a line to an item only when the document clearly associates it with that item.
-
-Examples:
-
-Product
-CGST
-SGST
-IGST
-Item Freight
-Item Insurance
-
-If association is unclear, place the line in invoice_lines.
-
-Never duplicate lines.
-
----
-
-# Invoice Lines
-
-Use invoice_lines for charges not clearly tied to a specific item.
-
-Examples:
-
-* Freight
-* Insurance
-* Packing
-* Transportation
-* Round Off
-* Discounts
-* Invoice-Level Taxes
-
----
-
-# Tax Rules
-
-Extract only explicitly shown tax values.
-
-Supported taxes include:
-
-* CGST
-* SGST
-* IGST
-* CESS
-* Other Taxes
-
-Do not calculate missing tax values.
-
-Do not convert missing values to zero.
-
-Use null instead.
-
----
-
-# Totals Rules
-
-Extract totals only from summary sections.
-
-CRITICAL: Round-off must ALWAYS go into round_off_amount only.
-Never place round-off in other_charges under any circumstances.
-Round-off is identifiable as small adjustment values (positive or negative)
-used to make the invoice total a round number.
-
-other_charges includes ONLY: insurance, packing, loading,
-unloading, handling — never taxes, never round-off.
-
-Extract totals only from summary sections.
-
-Examples:
-
-* Taxable Amount
-* CGST Amount
-* SGST Amount
-* IGST Amount
-* CESS Amount
-* Total Tax Amount
-* Round Off Amount
-* Grand Total
-
-Never calculate totals.
-
----
-
-# Ignore Completely
-
-Do not extract or classify:
-
-* Terms & Conditions
-* Legal Text
-* Notes
-* Declarations
-* Signatures
-* QR Codes
-* Barcodes
-* Watermarks
-* URLs
-* Email Addresses
-* Phone Numbers
-* Driver Information
-* Banking Information
-* Repeated Sections
-* Footer Content
-
-unless explicitly required by the schema.
-
----
-
-# Validation
-
-Before returning:
-
-1. Every extracted value must exist in the document.
-2. Every product item must be a genuine billable product/service.
-3. Taxes must not be classified as products.
-4. Charges must not be classified as products.
-5. Summary rows must not be classified as products.
-6. No duplicate entries should exist.
-7. All required schema fields must be present.
-8. Use null for missing values.
-9. Ensure output strictly conforms to the schema.
-
----
-
-# Confidence Rule
-
-When uncertain:
-
-* Prefer null over incorrect values.
-* Prefer excluding a row over misclassifying it.
-* Never fabricate information.
-
-Return only the structured output matching the provided schema.
+- Output **only the JSON object** — no explanation, no markdown fences, no preamble.
+- The JSON must be **valid** and **complete** — do not omit required fields.
+- For optional fields not found in the document: use `null` for strings, `0` for numbers.
+- Do not hallucinate values. If a field is genuinely absent, use `null` or the schema default.
+- Numbers must be plain JSON numbers — not strings, not currency-formatted.
+- Before finalising, run this checklist:
+  1. Is `voucher_type` correct? (Who is Shubham Steel on this invoice?)
+  2. Does `grand_total` match `amount_in_words`?
+  3. Does each `taxable_amount × (1 + gst_rate/100) ≈ line_total`?
+  4. Does `sum(taxable_amount) ≈ totals.taxable_value`?
+  5. Is `freight_amount` 0 unless an LR with a printed freight total is present?
 """
 
 

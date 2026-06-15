@@ -26,6 +26,10 @@ class LedgerEntry:
     is_debit: bool
     is_party: bool = False
     is_bank: bool = False
+    entry_kind: str = ""
+    tally_deemed_positive: str = ""
+    tally_amount_sign: int = 0
+    round_type_not_applicable: bool = False
 
 
 @dataclass
@@ -36,6 +40,9 @@ class InventoryEntry:
     is_debit: bool
     quantity: str = ""
     rate: str = ""
+    unit: str = ""
+    godown_name: str = ""
+    batch_name: str = ""
 
 
 def post_to_tally(payload):
@@ -66,6 +73,11 @@ def list_tally_bank_accounts(company_name=None):
                 if (account.get("parent") or "").strip().lower() == "bank accounts"
             ]
         }
+
+
+def list_tally_stock_items(company_name=None):
+    with _tally_company(_clean_text(company_name)):
+        return {"stock_items": _fetch_all_stock_items()}
 
 
 def get_tally_account_totals(company_name=None, account_name=None, from_date=None, to_date=None, skip_voucher_types=None):
@@ -176,7 +188,7 @@ def _post_to_tally(document_type, source, data):
             "tally": _empty_tally_summary(),
         }
 
-    _ensure_tally_masters(vouchers_to_post)
+    _ensure_tally_masters(vouchers_to_post, allow_create=document_type != "invoice")
 
     response_summary = _post_vouchers_in_batches(vouchers_to_post)
 
@@ -222,6 +234,9 @@ def _post_vouchers_in_batches(vouchers):
         summary["created"] += batch_summary["created"]
         summary["altered"] += batch_summary["altered"]
         summary["errors"] += batch_summary["errors"]
+        summary["exceptions"] += batch_summary["exceptions"]
+        summary["cancelled"] += batch_summary["cancelled"]
+        summary["ignored"] += batch_summary["ignored"]
         summary["line_errors"].extend(batch_summary["line_errors"])
         summary["raw_batches"].append(batch_summary.get("raw", ""))
 
@@ -233,6 +248,9 @@ def _empty_tally_summary():
         "created": 0,
         "altered": 0,
         "errors": 0,
+        "exceptions": 0,
+        "cancelled": 0,
+        "ignored": 0,
         "line_errors": [],
         "raw_batches": [],
         "batches": 0,
@@ -368,17 +386,22 @@ def _invoice_vouchers(source, invoice):
     is_purchase = voucher_type == "Purchase"
     totals = invoice.get("totals") or {}
 
-    party = invoice.get("seller") if is_purchase else invoice.get("buyer")
-    party_ledger = (party or {}).get("name") or _env("TALLY_DEFAULT_PARTY_LEDGER", "Suspense")
-    base_ledger = _env("TALLY_PURCHASE_LEDGER", "Purchase") if is_purchase else _env("TALLY_SALES_LEDGER", "Sales")
+    party = invoice.get("supplier") if is_purchase else invoice.get("buyer")
+    party_ledger = _clean_text(invoice.get("party_ledger")) or (party or {}).get("name") or _env("TALLY_DEFAULT_PARTY_LEDGER", "Suspense")
+    base_ledger = (
+        _clean_text(invoice.get("base_ledger"))
+        or (_env("TALLY_PURCHASE_LEDGER", "Purchase") if is_purchase else _env("TALLY_SALES_LEDGER", "Sales"))
+    )
     date = _tally_date(invoice.get("invoice_date"), field_name="invoice_date")
     _validate_invoice_financial_year(invoice.get("invoice_no"), date)
     grand_total = _number(totals.get("grand_total"))
-    taxable_amount = _number(totals.get("taxable_amount"))
+    taxable_amount = _number(totals.get("taxable_value") or totals.get("taxable_amount"))
     base_amount = taxable_amount or grand_total
 
     if grand_total <= 0:
         raise ValueError("Invoice grand_total must be greater than zero.")
+
+    _validate_invoice_tax_ledgers(invoice, base_ledger, is_purchase)
 
     inventory_entries = _invoice_inventory_entries(
         invoice,
@@ -391,13 +414,15 @@ def _invoice_vouchers(source, invoice):
     if is_purchase:
         entries = [
             *base_entries,
-            *_tax_entries(totals, input_tax=True),
+            *_line_item_charge_entries(invoice, is_debit=True),
+            *_invoice_tax_entries(invoice, input_tax=True, has_inventory=bool(inventory_entries)),
             *_invoice_charge_entries(invoice, is_debit=True),
         ]
     else:
         entries = [
             *base_entries,
-            *_tax_entries(totals, input_tax=False),
+            *_line_item_charge_entries(invoice, is_debit=False),
+            *_invoice_tax_entries(invoice, input_tax=False, has_inventory=bool(inventory_entries)),
             *_invoice_charge_entries(invoice, is_debit=False),
         ]
 
@@ -410,6 +435,7 @@ def _invoice_vouchers(source, invoice):
             "voucher_type": voucher_type,
             "voucher_number": invoice.get("invoice_no") or "",
             "party_ledger": party_ledger,
+            "party_name": party_ledger,
             "narration": _join_narration(
                 _prefixed("Invoice", invoice.get("invoice_no")),
                 _prefixed("IRN", invoice.get("irn")),
@@ -421,96 +447,230 @@ def _invoice_vouchers(source, invoice):
     ]
 
 
-def _tax_entries(totals, input_tax):
+def _invoice_tax_entries(invoice, input_tax, has_inventory=False):
+    if has_inventory and not _invoice_should_post_tax_ledgers():
+        return []
+
+    return _tax_entries(invoice, input_tax)
+
+
+def _invoice_should_post_tax_ledgers():
+    return _env("TALLY_POST_INVOICE_TAX_LEDGERS", "Yes").strip().lower() in {"yes", "true", "1"}
+
+
+def _tax_entries(invoice, input_tax):
+    totals = invoice.get("totals") or {}
+    tax_ledgers = invoice.get("tax_ledgers") or {}
     prefix = "INPUT" if input_tax else "OUTPUT"
     is_debit = input_tax
     tax_fields = [
-        ("cgst_amount", _env(f"TALLY_{prefix}_CGST_LEDGER", "Input CGST" if input_tax else "Output CGST")),
-        ("sgst_amount", _env(f"TALLY_{prefix}_SGST_LEDGER", "Input SGST" if input_tax else "Output SGST")),
-        ("igst_amount", _env(f"TALLY_{prefix}_IGST_LEDGER", "Input IGST" if input_tax else "Output IGST")),
+        ("total_cgst", "cgst", _env(f"TALLY_{prefix}_CGST_LEDGER", "Input CGST" if input_tax else "Output CGST")),
+        ("total_sgst", "sgst", _env(f"TALLY_{prefix}_SGST_LEDGER", "Input SGST" if input_tax else "Output SGST")),
+        ("total_igst", "igst", _env(f"TALLY_{prefix}_IGST_LEDGER", "Input IGST" if input_tax else "Output IGST")),
+        ("total_cess", "cess", _env("TALLY_OTHER_TAX_LEDGER", "Other Charges")),
     ]
 
-    return [
-        LedgerEntry(ledger_name, _number(totals.get(field)), is_debit)
-        for field, ledger_name in tax_fields
-        if _number(totals.get(field)) > 0
-    ]
-
-
-def _invoice_inventory_entries(invoice, ledger_name, is_debit, fallback_amount):
-    items = invoice.get("items") or []
-    inventory_entries = []
-
-    for item in items:
-        item_name = _clean_text(item.get("description")) or _env("TALLY_DEFAULT_STOCK_ITEM", "Item")
-        amount = _number(item.get("line_total")) or _number(item.get("taxable_amount"))
-        if amount == 0 and len(items) == 1:
-            amount = fallback_amount
-        if amount == 0:
-            continue
-
-        inventory_entries.append(
-            InventoryEntry(
-                item_name=item_name,
-                ledger_name=ledger_name,
-                amount=abs(amount),
-                is_debit=is_debit if amount > 0 else not is_debit,
-                quantity=_clean_text(item.get("quantity")),
-                rate=_inventory_rate(item.get("rate"), item.get("quantity")),
-            )
-        )
-
-    return inventory_entries
-
-
-def _invoice_charge_entries(invoice, is_debit):
     entries = []
-    round_off_amount = _number((invoice.get("totals") or {}).get("round_off_amount"))
-
-    for line in invoice.get("invoice_lines") or []:
-        if round_off_amount and _is_round_off_line(line):
+    for field, tax_key, ledger_name in tax_fields:
+        amount = _number(totals.get(field))
+        if amount <= 0:
             continue
 
-        amount = _number(line.get("amount"))
-        if amount == 0:
-            continue
-        ledger_name = _charge_ledger(line.get("line_type"), line.get("description"))
-        entries.append(LedgerEntry(ledger_name, abs(amount), is_debit if amount > 0 else not is_debit))
-
-    if round_off_amount:
         entries.append(
             LedgerEntry(
-                _env("TALLY_ROUND_OFF_LEDGER", "Round Off"),
-                abs(round_off_amount),
-                is_debit if round_off_amount > 0 else not is_debit,
+                _clean_text(tax_ledgers.get(tax_key)) or ledger_name,
+                amount,
+                is_debit,
+                entry_kind="tax",
+                round_type_not_applicable=not input_tax,
             )
         )
 
     return entries
 
 
-def _charge_ledger(line_type, description):
+def _validate_invoice_tax_ledgers(invoice, base_ledger, is_purchase):
+    totals = invoice.get("totals") or {}
+    tax_ledgers = invoice.get("tax_ledgers") or {}
+    base_key = _clean_text(base_ledger).lower()
+    base_label = "purchase" if is_purchase else "sales"
+    tax_fields = [
+        ("total_cgst", "cgst", "CGST Ledger"),
+        ("total_sgst", "sgst", "SGST Ledger"),
+        ("total_igst", "igst", "IGST Ledger"),
+        ("total_cess", "cess", "Cess Ledger"),
+    ]
+
+    for total_key, tax_key, label in tax_fields:
+        if _number(totals.get(total_key)) <= 0:
+            continue
+
+        selected_ledger = _clean_text(tax_ledgers.get(tax_key))
+        selected_key = selected_ledger.lower()
+        if selected_key and selected_key == base_key:
+            raise ValueError(
+                f"{label} is set to '{selected_ledger}', which is also the main {base_label} ledger. "
+                f"Select a Duties & Taxes ledger for {label} before posting."
+            )
+
+
+def _invoice_inventory_entries(invoice, ledger_name, is_debit, fallback_amount):
+    items = invoice.get("line_items") or invoice.get("items") or []
+    inventory_entries = []
+
+    for item in items:
+        quantity = _item_quantity(item)
+        explicit_stock_item = _clean_text(item.get("stock_item_name"))
+        if not quantity and not explicit_stock_item:
+            continue
+
+        item_name = explicit_stock_item or _clean_text(item.get("description")) or _env("TALLY_DEFAULT_STOCK_ITEM", "Item")
+        amount = _number(item.get("taxable_amount")) or _number(item.get("line_total"))
+        if amount == 0 and len(items) == 1:
+            amount = fallback_amount
+        if amount == 0:
+            continue
+        item_ledger_name = (
+            _clean_text(item.get("inventory_ledger"))
+            or _clean_text(item.get("default_purchase_ledger") if is_debit else item.get("default_sales_ledger"))
+            or ledger_name
+        )
+
+        inventory_entries.append(
+            InventoryEntry(
+                item_name=item_name,
+                ledger_name=item_ledger_name,
+                amount=abs(amount),
+                is_debit=is_debit if amount > 0 else not is_debit,
+                quantity=quantity,
+                rate=_inventory_rate(item.get("rate"), quantity),
+                unit=_item_unit(item),
+                godown_name=_clean_text(item.get("godown_name")) or _env("TALLY_DEFAULT_GODOWN", "Main Location"),
+                batch_name=_clean_text(item.get("batch_name")) or _env("TALLY_DEFAULT_BATCH", "Primary Batch"),
+            )
+        )
+
+    return inventory_entries
+
+
+def _line_item_charge_entries(invoice, is_debit):
+    entries = []
+    charge_ledgers = invoice.get("charge_ledgers") or {}
+    items = invoice.get("line_items") or invoice.get("items") or []
+
+    for item_index, item in enumerate(items):
+        if _item_quantity(item) or _clean_text(item.get("stock_item_name")):
+            continue
+
+        amount = _number(item.get("taxable_amount")) or _number(item.get("amount")) or _number(item.get("line_total"))
+        if amount == 0:
+            continue
+
+        charge_key = _charge_key(item.get("line_type"), item.get("description"))
+        ledger_name = (
+            _clean_text(item.get("charge_ledger"))
+            or _clean_text(item.get("ledger_name"))
+            or _clean_text(charge_ledgers.get(f"line_item_{item_index}"))
+            or _clean_text(charge_ledgers.get(charge_key))
+            or _charge_ledger(charge_key, item.get("description"))
+        )
+        entries.append(
+            LedgerEntry(
+                ledger_name,
+                abs(amount),
+                is_debit if amount > 0 else not is_debit,
+                entry_kind="charge",
+            )
+        )
+
+    return entries
+
+
+def _invoice_charge_entries(invoice, is_debit):
+    entries = []
+    charge_ledgers = invoice.get("charge_ledgers") or {}
+    totals = invoice.get("totals") or {}
+    round_off_amount = _number(totals.get("rounding_off") or totals.get("round_off_amount"))
+
+    lines = invoice.get("other_charges") or invoice.get("invoice_lines") or []
+    for line_index, line in enumerate(lines):
+        if round_off_amount and _is_round_off_line(line):
+            continue
+
+        amount = _number(line.get("amount"))
+        if amount == 0:
+            continue
+        charge_key = _charge_key(line.get("line_type"), line.get("description"))
+        ledger_name = _clean_text(charge_ledgers.get(f"line_{line_index}")) or _clean_text(charge_ledgers.get(charge_key)) or _charge_ledger(charge_key, line.get("description"))
+        entries.append(LedgerEntry(ledger_name, abs(amount), is_debit if amount > 0 else not is_debit))
+
+    transport = invoice.get("transport") or invoice.get("transportation") or {}
+    freight_amount = _number(transport.get("freight_amount"))
+    if freight_amount:
+        entries.append(
+            LedgerEntry(
+                _clean_text(charge_ledgers.get("transport")) or _env("TALLY_FREIGHT_LEDGER", "Freight"),
+                abs(freight_amount),
+                is_debit if freight_amount > 0 else not is_debit,
+                entry_kind="transport",
+            )
+        )
+
+    if round_off_amount:
+        entries.append(
+            LedgerEntry(
+                _clean_text(charge_ledgers.get("round_off")) or _env("TALLY_ROUND_OFF_LEDGER", "Round Off"),
+                abs(round_off_amount),
+                is_debit if round_off_amount > 0 else not is_debit,
+                entry_kind="round_off",
+            )
+        )
+
+    return entries
+
+
+def _charge_key(line_type, description):
     key = f"{line_type or ''} {description or ''}".lower()
 
     if "freight" in key or "transport" in key:
-        return _env("TALLY_FREIGHT_LEDGER", "Freight")
-    if "round" in key:
-        return _env("TALLY_ROUND_OFF_LEDGER", "Round Off")
+        return "freight"
+    if "round" in key or "r/off" in key:
+        return "round_off"
     if "pack" in key:
-        return _env("TALLY_PACKING_LEDGER", "Packing Charges")
+        return "packing"
     if "insur" in key:
+        return "insurance"
+    return "other"
+
+
+def _charge_ledger(line_type, description):
+    key = _charge_key(line_type, description)
+
+    if key == "freight":
+        return _env("TALLY_FREIGHT_LEDGER", "Freight")
+    if key == "round_off":
+        return _env("TALLY_ROUND_OFF_LEDGER", "Round Off")
+    if key == "packing":
+        return _env("TALLY_PACKING_LEDGER", "Packing Charges")
+    if key == "insurance":
         return _env("TALLY_INSURANCE_LEDGER", "Insurance")
 
     return _env("TALLY_OTHER_CHARGES_LEDGER", "Other Charges")
 
 
-def _ensure_tally_masters(vouchers):
+def _ensure_tally_masters(vouchers, allow_create=True):
     ledger_specs = _ledger_specs_for_vouchers(vouchers)
     ledgers = {}
     if ledger_specs:
         ledger_names = sorted(ledger_specs)
         ledgers = _fetch_ledgers(ledger_names)
         missing_ledgers = [ledger_name for ledger_name in ledger_names if ledger_name not in ledgers]
+        if missing_ledgers and not allow_create:
+            raise ValueError(
+                "These Tally ledgers do not exist. Create them in Tally or select existing ledgers before posting: "
+                + ", ".join(_missing_ledger_detail(ledger_name, ledger_specs) for ledger_name in missing_ledgers)
+                + "."
+            )
         if missing_ledgers:
             _create_ledgers({ledger_name: ledger_specs[ledger_name] for ledger_name in missing_ledgers})
             ledgers = _fetch_ledgers(ledger_names)
@@ -529,10 +689,16 @@ def _ensure_tally_masters(vouchers):
 
     stock_item_specs = _stock_item_specs_for_vouchers(vouchers)
     if stock_item_specs:
-        _ensure_units({spec["unit"] for spec in stock_item_specs.values() if spec.get("unit")})
         stock_item_names = sorted(stock_item_specs)
         stock_items = _fetch_stock_items(stock_item_names)
         missing_stock_items = [item_name for item_name in stock_item_names if item_name not in stock_items]
+        if missing_stock_items and not allow_create:
+            raise ValueError(
+                "These Tally stock items do not exist. Create them in Tally or select existing stock items before posting: "
+                + ", ".join(missing_stock_items)
+                + "."
+            )
+        _ensure_units({spec["unit"] for spec in stock_item_specs.values() if spec.get("unit")})
         if missing_stock_items:
             _create_stock_items({item_name: stock_item_specs[item_name] for item_name in missing_stock_items})
             stock_items = _fetch_stock_items(stock_item_names)
@@ -543,6 +709,7 @@ def _ensure_tally_masters(vouchers):
 
     for voucher in vouchers:
         voucher_type = voucher["voucher_type"]
+        _validate_round_off_ledgers(voucher, ledgers)
         party_ledger = voucher.get("party_ledger")
         if not party_ledger:
             continue
@@ -557,6 +724,25 @@ def _ensure_tally_masters(vouchers):
             raise ValueError(
                 f"Purchase party ledger '{party_ledger}' is under '{parent}'. "
                 "Move it to 'Sundry Creditors' in Tally and retry."
+            )
+
+
+def _validate_round_off_ledgers(voucher, ledgers):
+    for entry in voucher.get("entries") or []:
+        if getattr(entry, "entry_kind", "") != "round_off":
+            continue
+
+        parent = (ledgers.get(entry.ledger_name) or {}).get("parent", "")
+        parent_key = parent.lower()
+        if entry.is_debit and "income" in parent_key:
+            raise ValueError(
+                f"Round-off ledger '{entry.ledger_name}' is under '{parent}', but this round-off posts as Debit. "
+                "Select an Expense ledger for debit round-off."
+            )
+        if not entry.is_debit and "expense" in parent_key:
+            raise ValueError(
+                f"Round-off ledger '{entry.ledger_name}' is under '{parent}', but this round-off posts as Credit. "
+                "Select an Income ledger for credit round-off."
             )
 
 
@@ -605,7 +791,7 @@ def _stock_item_specs_for_vouchers(vouchers):
                 entry.item_name,
                 {
                     "parent": _env("TALLY_STOCK_ITEM_PARENT", "Primary"),
-                    "unit": _stock_unit(entry.quantity),
+                    "unit": entry.unit or _stock_unit(entry.quantity),
                 },
             )
 
@@ -812,6 +998,111 @@ def _fetch_stock_items(item_names):
     for batch in _chunks(sorted(item_names), _tally_lookup_batch_size()):
         stock_items.update(_fetch_stock_items_batch(batch))
     return stock_items
+
+
+def _fetch_all_stock_items():
+    company_name = _company_name()
+    company_variable = (
+        f"<SVCURRENTCOMPANY>{_xml(company_name)}</SVCURRENTCOMPANY>"
+        if company_name
+        else ""
+    )
+    request_xml = (
+        "<ENVELOPE>"
+        "<HEADER>"
+        "<VERSION>1</VERSION>"
+        "<TALLYREQUEST>Export</TALLYREQUEST>"
+        "<TYPE>Collection</TYPE>"
+        "<ID>AllStockItems</ID>"
+        "</HEADER>"
+        "<BODY>"
+        "<DESC>"
+        "<STATICVARIABLES>"
+        "<SVEXPORTFORMAT>$$SysName:XML</SVEXPORTFORMAT>"
+        f"{company_variable}"
+        "</STATICVARIABLES>"
+        "<TDL>"
+        "<TDLMESSAGE>"
+        '<COLLECTION NAME="AllStockItems">'
+        "<TYPE>StockItem</TYPE>"
+        "<FETCH>Name,BaseUnits,Parent,ClosingBalance,OpeningBalance,Description,CostingMethod,ValuationMethod,IsBatchWiseOn,IsPerishableOn,GSTDetails,HSNDetails,RateDetails,GSTDETAILS.LIST,HSNDETAILS.LIST,RATEDETAILS.LIST</FETCH>"
+        "</COLLECTION>"
+        "</TDLMESSAGE>"
+        "</TDL>"
+        "</DESC>"
+        "</BODY>"
+        "</ENVELOPE>"
+    )
+
+    response_text = _post_xml_to_tally(request_xml)
+    root = _parse_tally_xml(response_text)
+    stock_items = []
+    seen_names = set()
+    for item in root.findall(".//STOCKITEM"):
+        name = (item.attrib.get("NAME") or item.findtext("NAME") or "").strip()
+        if not name or name.lower() in seen_names:
+            continue
+        seen_names.add(name.lower())
+        stock_items.append(_stock_item_payload(item, name))
+
+    return sorted(stock_items, key=lambda item: item["name"].lower())
+
+
+def _stock_item_payload(item, name):
+    unit = _first_text(item, "BASEUNITS", "BASEUNIT", "BASEUNITS.LIST")
+    hsn = _first_text(
+        item,
+        "HSNCODE",
+        "HSN",
+        "GSTHSNCODE",
+        "GSTHSNNAME",
+        "HSNMASTERNAME",
+    )
+    gst_rate = _stock_item_gst_rate(item)
+
+    return {
+        "name": name,
+        "unit": unit,
+        "base_unit": unit,
+        "parent": _first_text(item, "PARENT"),
+        "description": _first_text(item, "DESCRIPTION"),
+        "hsn": hsn,
+        "hsn_code": hsn,
+        "gst_rate": gst_rate,
+        "taxability": _first_text(item, "TAXABILITY", "GSTTAXABILITY"),
+        "default_sales_ledger": _first_text(item, "SALESLEDGER", "SALELEDGER", "DEFAULTSALESLEDGER"),
+        "default_purchase_ledger": _first_text(item, "PURCHASELEDGER", "DEFAULTPURCHASELEDGER"),
+        "opening_balance": _first_text(item, "OPENINGBALANCE"),
+        "closing_balance": _first_text(item, "CLOSINGBALANCE"),
+        "costing_method": _first_text(item, "COSTINGMETHOD"),
+        "valuation_method": _first_text(item, "VALUATIONMETHOD"),
+        "batch_required": _yes_no(_first_text(item, "ISBATCHWISEON", "BATCHWISEON")),
+        "expiry_required": _yes_no(_first_text(item, "ISPERISHABLEON", "ISPERISHABLE")),
+    }
+
+
+def _stock_item_gst_rate(item):
+    rates = []
+    for element in item.iter():
+        name = _local_name(element.tag).upper()
+        text = _clean_text(element.text)
+        if not text:
+            continue
+        if name in {"GSTRATE", "GSTSLABRATE"} or name.endswith("GSTRATE"):
+            rate = _number(text)
+            if rate:
+                rates.append(rate)
+
+    if rates:
+        return round(sum(rates), 2)
+
+    duty_rates = []
+    for rate_detail in item.findall(".//RATEDETAILS.LIST"):
+        rate = _number(_first_text(rate_detail, "GSTRATE", "RATE"))
+        if rate:
+            duty_rates.append(rate)
+
+    return round(sum(duty_rates), 2) if duty_rates else ""
 
 
 def _fetch_stock_items_batch(item_names):
@@ -1470,23 +1761,24 @@ def _build_envelope(vouchers):
     return (
         "<ENVELOPE>"
         "<HEADER>"
-        "<VERSION>1</VERSION>"
-        "<TALLYREQUEST>Import</TALLYREQUEST>"
-        "<TYPE>Data</TYPE>"
-        f"<ID>{_xml(import_id)}</ID>"
+        "<TALLYREQUEST>Import Data</TALLYREQUEST>"
         "</HEADER>"
         "<BODY>"
-        "<DESC>"
+        "<IMPORTDATA>"
+        "<REQUESTDESC>"
+        f"<REPORTNAME>{_xml(import_id)}</REPORTNAME>"
         f"<STATICVARIABLES>{static_variables}</STATICVARIABLES>"
-        "</DESC>"
-        f"<DATA>{voucher_messages}</DATA>"
+        "</REQUESTDESC>"
+        f"<REQUESTDATA>{voucher_messages}</REQUESTDATA>"
+        "</IMPORTDATA>"
         "</BODY>"
         "</ENVELOPE>"
     )
 
 
 def _voucher_xml(voucher):
-    entries = "".join(_ledger_entry_xml(entry) for entry in voucher["entries"])
+    ledger_list_tag = _voucher_ledger_list_tag(voucher)
+    entries = "".join(_ledger_entry_xml(entry, ledger_list_tag) for entry in voucher["entries"])
     inventory_entries = "".join(
         _inventory_entry_xml(entry)
         for entry in voucher.get("inventory_entries") or []
@@ -1496,6 +1788,9 @@ def _voucher_xml(voucher):
     narration_xml = f"<NARRATION>{narration}</NARRATION>" if narration else ""
     voucher_number = _xml(voucher.get("voucher_number") or "")
     voucher_number_xml = f"<VOUCHERNUMBER>{voucher_number}</VOUCHERNUMBER>" if voucher_number else ""
+    voucher_numbering_xml = _voucher_numbering_xml(voucher)
+    voucher_gst_xml = _voucher_gst_xml(voucher)
+    voucher_party_xml = _voucher_party_xml(voucher)
     voucher_view = _voucher_view(voucher)
     voucher_view_xml = (
         f"<PERSISTEDVIEW>{_xml(voucher_view)}</PERSISTEDVIEW>"
@@ -1508,11 +1803,15 @@ def _voucher_xml(voucher):
         f"<DATE>{voucher_date}</DATE>"
         f"<EFFECTIVEDATE>{voucher_date}</EFFECTIVEDATE>"
         f"<VOUCHERTYPENAME>{_xml(voucher['voucher_type'])}</VOUCHERTYPENAME>"
+        f"{voucher_party_xml}"
         f"{voucher_view_xml}"
         f"{voucher_number_xml}"
+        f"{voucher_numbering_xml}"
         f"{narration_xml}"
         f"<PARTYLEDGERNAME>{_xml(voucher.get('party_ledger') or '')}</PARTYLEDGERNAME>"
+        f"{_voucher_entry_mode_xml(voucher)}"
         f"<ISINVOICE>{_is_invoice_voucher(voucher)}</ISINVOICE>"
+        f"{voucher_gst_xml}"
         f"{entries}"
         f"{inventory_entries}"
         "</VOUCHER>"
@@ -1520,18 +1819,120 @@ def _voucher_xml(voucher):
     )
 
 
-def _ledger_entry_xml(entry):
-    amount = _tally_amount(entry)
-    deemed_positive = "Yes" if entry.is_debit else "No"
-    is_party_ledger = "Yes" if entry.is_party else "No"
+def _voucher_party_xml(voucher):
+    party_name = _clean_text(voucher.get("party_name") or voucher.get("party_ledger"))
+    party_ledger = _clean_text(voucher.get("party_ledger") or party_name)
+    if not party_name or voucher.get("voucher_type") not in {"Sales", "Purchase"}:
+        return ""
+
+    party_xml = f"<PARTYNAME>{_xml(party_name)}</PARTYNAME>"
+    if voucher.get("voucher_type") == "Sales":
+        party_xml += (
+            f"<BASICBUYERNAME>{_xml(party_name)}</BASICBUYERNAME>"
+            f"<BASICBASEPARTYNAME>{_xml(party_ledger)}</BASICBASEPARTYNAME>"
+        )
+    return party_xml
+
+
+def _voucher_ledger_list_tag(voucher):
+    if voucher.get("voucher_type") in {"Sales", "Purchase"} and voucher.get("inventory_entries"):
+        return "LEDGERENTRIES.LIST"
+    return "ALLLEDGERENTRIES.LIST"
+
+
+def _voucher_gst_xml(voucher):
+    if voucher.get("voucher_type") not in {"Sales", "Purchase"}:
+        return ""
+
+    gstin = _clean_text(voucher.get("company_gstin")) or _env("TALLY_COMPANY_GSTIN", "")
+    state = _clean_text(voucher.get("company_gst_state")) or _env("TALLY_COMPANY_GST_STATE", "")
+    registration_name = (
+        _clean_text(voucher.get("gst_registration_name"))
+        or _env("TALLY_GST_REGISTRATION_NAME", "")
+        or (f"{state} Registration" if state else "")
+    )
+    place_of_supply = _clean_text(voucher.get("place_of_supply")) or _env("TALLY_PLACE_OF_SUPPLY", state)
+
+    if not any((gstin, state, registration_name, place_of_supply)):
+        return ""
 
     return (
-        "<ALLLEDGERENTRIES.LIST>"
+        f"<CMPGSTIN>{_xml(gstin)}</CMPGSTIN>" if gstin else ""
+    ) + (
+        "<CMPGSTREGISTRATIONTYPE>Regular</CMPGSTREGISTRATIONTYPE>" if gstin else ""
+    ) + (
+        f"<CMPGSTSTATE>{_xml(state)}</CMPGSTSTATE>" if state else ""
+    ) + (
+        f"<PLACEOFSUPPLY>{_xml(place_of_supply)}</PLACEOFSUPPLY>" if place_of_supply else ""
+    ) + (
+        f'<GSTREGISTRATION TAXTYPE="GST" TAXREGISTRATION="{_xml(gstin)}">{_xml(registration_name)}</GSTREGISTRATION>'
+        if gstin and registration_name
+        else ""
+    ) + (
+        f"<VCHSTATUSTAXUNIT>{_xml(registration_name)}</VCHSTATUSTAXUNIT>" if registration_name else ""
+    )
+
+
+def _voucher_numbering_xml(voucher):
+    voucher_number = _clean_text(voucher.get("voucher_number"))
+    voucher_type = voucher.get("voucher_type")
+    if not voucher_number or voucher_type not in {"Sales", "Purchase"}:
+        return ""
+
+    series = (
+        _clean_text(voucher.get("voucher_number_series"))
+        or _env(f"TALLY_{str(voucher_type).upper()}_VOUCHER_NUMBER_SERIES", "")
+        or _env("TALLY_VOUCHER_NUMBER_SERIES", "")
+    )
+    series_xml = f"<VOUCHERNUMBERSERIES>{_xml(series)}</VOUCHERNUMBERSERIES>" if series else ""
+
+    return (
+        f"<OVRDTRANSNUMBER>{_xml(voucher_number)}</OVRDTRANSNUMBER>"
+        "<ISOPTIONAL>No</ISOPTIONAL>"
+        "<NUMBERINGSTYLE>Manual</NUMBERINGSTYLE>"
+        f"{series_xml}"
+    )
+
+
+def _ledger_entry_xml(entry, list_tag="ALLLEDGERENTRIES.LIST"):
+    amount = _tally_amount(entry)
+    deemed_positive = entry.tally_deemed_positive or ("Yes" if entry.is_debit else "No")
+    is_party_ledger = "Yes" if entry.is_party else "No"
+    round_type_xml = "<ROUNDTYPE>&#4; Not Applicable</ROUNDTYPE>" if entry.round_type_not_applicable else ""
+
+    if list_tag == "LEDGERENTRIES.LIST":
+        vat_exp_amount_xml = f"<VATEXPAMOUNT>{amount:.2f}</VATEXPAMOUNT>" if entry.entry_kind == "tax" else ""
+        return (
+            f"<{list_tag}>"
+            f"{round_type_xml}"
+            f"<LEDGERNAME>{_xml(entry.ledger_name)}</LEDGERNAME>"
+            "<GSTCLASS>&#4; Not Applicable</GSTCLASS>"
+            f"<ISDEEMEDPOSITIVE>{deemed_positive}</ISDEEMEDPOSITIVE>"
+            "<LEDGERFROMITEM>No</LEDGERFROMITEM>"
+            "<REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>"
+            f"<ISPARTYLEDGER>{is_party_ledger}</ISPARTYLEDGER>"
+            "<GSTOVERRIDDEN>No</GSTOVERRIDDEN>"
+            "<ISGSTASSESSABLEVALUEOVERRIDDEN>No</ISGSTASSESSABLEVALUEOVERRIDDEN>"
+            "<STRDISGSTAPPLICABLE>No</STRDISGSTAPPLICABLE>"
+            "<STRDGSTISPARTYLEDGER>No</STRDGSTISPARTYLEDGER>"
+            "<STRDGSTISDUTYLEDGER>No</STRDGSTISDUTYLEDGER>"
+            "<CONTENTNEGISPOS>No</CONTENTNEGISPOS>"
+            f"<ISLASTDEEMEDPOSITIVE>{deemed_positive}</ISLASTDEEMEDPOSITIVE>"
+            "<ISCAPVATTAXALTERED>No</ISCAPVATTAXALTERED>"
+            "<ISCAPVATNOTCLAIMED>No</ISCAPVATNOTCLAIMED>"
+            f"<AMOUNT>{amount:.2f}</AMOUNT>"
+            f"{vat_exp_amount_xml}"
+            f"</{list_tag}>"
+        )
+
+    return (
+        f"<{list_tag}>"
         f"<LEDGERNAME>{_xml(entry.ledger_name)}</LEDGERNAME>"
+        f"{round_type_xml}"
         f"<ISDEEMEDPOSITIVE>{deemed_positive}</ISDEEMEDPOSITIVE>"
         f"<ISPARTYLEDGER>{is_party_ledger}</ISPARTYLEDGER>"
         f"<AMOUNT>{amount:.2f}</AMOUNT>"
-        "</ALLLEDGERENTRIES.LIST>"
+        f"</{list_tag}>"
     )
 
 
@@ -1541,6 +1942,12 @@ def _voucher_view(voucher):
     if voucher.get("inventory_entries"):
         return "Invoice Voucher View"
     return "Accounting Voucher View"
+
+
+def _voucher_entry_mode_xml(voucher):
+    if voucher.get("inventory_entries"):
+        return "<VCHENTRYMODE>Item Invoice</VCHENTRYMODE><DIFFACTUALQTY>No</DIFFACTUALQTY>"
+    return ""
 
 
 def _inventory_entry_xml(entry):
@@ -1553,24 +1960,77 @@ def _inventory_entry_xml(entry):
             f"<BILLEDQTY>{_xml(entry.quantity)}</BILLEDQTY>"
         )
     rate_xml = f"<RATE>{_xml(entry.rate)}</RATE>" if entry.rate else ""
+    batch_xml = ""
+    if entry.quantity:
+        batch_xml = (
+            "<BATCHALLOCATIONS.LIST>"
+            f"<GODOWNNAME>{_xml(entry.godown_name or _env('TALLY_DEFAULT_GODOWN', 'Main Location'))}</GODOWNNAME>"
+            f"<BATCHNAME>{_xml(entry.batch_name or _env('TALLY_DEFAULT_BATCH', 'Primary Batch'))}</BATCHNAME>"
+            "<INDENTNO>&#4; Not Applicable</INDENTNO>"
+            "<ORDERNO>&#4; Not Applicable</ORDERNO>"
+            "<TRACKINGNUMBER>&#4; Not Applicable</TRACKINGNUMBER>"
+            "<DYNAMICCSTISCLEARED>No</DYNAMICCSTISCLEARED>"
+            f"<AMOUNT>{amount:.2f}</AMOUNT>"
+            f"<ACTUALQTY>{_xml(entry.quantity)}</ACTUALQTY>"
+            f"<BILLEDQTY>{_xml(entry.quantity)}</BILLEDQTY>"
+            "</BATCHALLOCATIONS.LIST>"
+        )
 
     return (
         "<ALLINVENTORYENTRIES.LIST>"
         f"<STOCKITEMNAME>{_xml(entry.item_name)}</STOCKITEMNAME>"
+        "<GSTOVRDNISREVCHARGEAPPL>&#4; Not Applicable</GSTOVRDNISREVCHARGEAPPL>"
+        "<GSTOVRDNTYPEOFSUPPLY>Goods</GSTOVRDNTYPEOFSUPPLY>"
+        "<GSTRATEINFERAPPLICABILITY>As per Masters/Company</GSTRATEINFERAPPLICABILITY>"
+        "<GSTHSNINFERAPPLICABILITY>As per Masters/Company</GSTHSNINFERAPPLICABILITY>"
         f"<ISDEEMEDPOSITIVE>{deemed_positive}</ISDEEMEDPOSITIVE>"
+        "<ISGSTASSESSABLEVALUEOVERRIDDEN>No</ISGSTASSESSABLEVALUEOVERRIDDEN>"
+        "<STRDISGSTAPPLICABLE>No</STRDISGSTAPPLICABLE>"
+        "<CONTENTNEGISPOS>No</CONTENTNEGISPOS>"
+        f"<ISLASTDEEMEDPOSITIVE>{deemed_positive}</ISLASTDEEMEDPOSITIVE>"
+        "<ISAUTONEGATE>No</ISAUTONEGATE>"
+        "<ISCUSTOMSCLEARANCE>No</ISCUSTOMSCLEARANCE>"
+        "<ISTRACKCOMPONENT>No</ISTRACKCOMPONENT>"
+        "<ISTRACKPRODUCTION>No</ISTRACKPRODUCTION>"
+        "<ISPRIMARYITEM>No</ISPRIMARYITEM>"
+        "<ISSCRAP>No</ISSCRAP>"
         f"{quantity_xml}"
         f"{rate_xml}"
         f"<AMOUNT>{amount:.2f}</AMOUNT>"
+        f"{batch_xml}"
         "<ACCOUNTINGALLOCATIONS.LIST>"
         f"<LEDGERNAME>{_xml(entry.ledger_name)}</LEDGERNAME>"
+        "<GSTCLASS>&#4; Not Applicable</GSTCLASS>"
         f"<ISDEEMEDPOSITIVE>{deemed_positive}</ISDEEMEDPOSITIVE>"
+        "<LEDGERFROMITEM>No</LEDGERFROMITEM>"
+        "<REMOVEZEROENTRIES>No</REMOVEZEROENTRIES>"
+        "<ISPARTYLEDGER>No</ISPARTYLEDGER>"
+        "<GSTOVERRIDDEN>No</GSTOVERRIDDEN>"
+        "<ISGSTASSESSABLEVALUEOVERRIDDEN>No</ISGSTASSESSABLEVALUEOVERRIDDEN>"
+        "<STRDISGSTAPPLICABLE>No</STRDISGSTAPPLICABLE>"
+        "<STRDGSTISPARTYLEDGER>No</STRDGSTISPARTYLEDGER>"
+        "<STRDGSTISDUTYLEDGER>No</STRDGSTISDUTYLEDGER>"
+        "<CONTENTNEGISPOS>No</CONTENTNEGISPOS>"
+        f"<ISLASTDEEMEDPOSITIVE>{deemed_positive}</ISLASTDEEMEDPOSITIVE>"
+        "<ISCAPVATTAXALTERED>No</ISCAPVATTAXALTERED>"
+        "<ISCAPVATNOTCLAIMED>No</ISCAPVATNOTCLAIMED>"
         f"<AMOUNT>{amount:.2f}</AMOUNT>"
         "</ACCOUNTINGALLOCATIONS.LIST>"
+        "<DUTYHEADDETAILS.LIST></DUTYHEADDETAILS.LIST>"
+        "<RATEDETAILS.LIST><GSTRATEDUTYHEAD>CGST</GSTRATEDUTYHEAD></RATEDETAILS.LIST>"
+        "<RATEDETAILS.LIST><GSTRATEDUTYHEAD>SGST/UTGST</GSTRATEDUTYHEAD></RATEDETAILS.LIST>"
+        "<RATEDETAILS.LIST><GSTRATEDUTYHEAD>IGST</GSTRATEDUTYHEAD></RATEDETAILS.LIST>"
+        "<RATEDETAILS.LIST><GSTRATEDUTYHEAD>Cess</GSTRATEDUTYHEAD></RATEDETAILS.LIST>"
+        "<RATEDETAILS.LIST><GSTRATEDUTYHEAD>State Cess</GSTRATEDUTYHEAD></RATEDETAILS.LIST>"
         "</ALLINVENTORYENTRIES.LIST>"
     )
 
 
 def _tally_amount(entry):
+    if getattr(entry, "tally_amount_sign", 0) < 0:
+        return -abs(entry.amount)
+    if getattr(entry, "tally_amount_sign", 0) > 0:
+        return abs(entry.amount)
     return -abs(entry.amount) if entry.is_debit else abs(entry.amount)
 
 
@@ -1664,6 +2124,9 @@ def _parse_tally_response(response_text):
         "created": 0,
         "altered": 0,
         "errors": 0,
+        "exceptions": 0,
+        "cancelled": 0,
+        "ignored": 0,
         "line_errors": [],
         "raw": response_text,
     }
@@ -1673,7 +2136,7 @@ def _parse_tally_response(response_text):
     except ElementTree.ParseError:
         return summary
 
-    for key in ("CREATED", "ALTERED", "ERRORS"):
+    for key in ("CREATED", "ALTERED", "ERRORS", "EXCEPTIONS", "CANCELLED", "IGNORED"):
         element = root.find(f".//{key}")
         if element is not None and element.text:
             summary[key.lower()] = int(_number(element.text))
@@ -1684,8 +2147,21 @@ def _parse_tally_response(response_text):
         if element.text and element.text.strip()
     ]
 
-    if summary["errors"] or summary["line_errors"]:
-        raise RuntimeError("; ".join(summary["line_errors"]) or "Tally reported an import error.")
+    if summary["errors"] or summary["exceptions"] or summary["cancelled"] or summary["line_errors"]:
+        voucher_number = _clean_text(root.findtext(".//VCHNUMBER"))
+        detail = "; ".join(summary["line_errors"])
+        if not detail:
+            counts = []
+            if summary["errors"]:
+                counts.append(f"{summary['errors']} error(s)")
+            if summary["exceptions"]:
+                counts.append(f"{summary['exceptions']} exception(s)")
+            if summary["cancelled"]:
+                counts.append(f"{summary['cancelled']} cancelled")
+            detail = "Tally reported " + ", ".join(counts) + "."
+        if voucher_number:
+            detail = f"{detail} Voucher: {voucher_number}."
+        raise RuntimeError(detail)
 
     return summary
 
@@ -1772,6 +2248,27 @@ def _clean_text(value):
     return str(value).strip()
 
 
+def _local_name(tag):
+    return str(tag or "").rsplit("}", 1)[-1]
+
+
+def _first_text(element, *names):
+    wanted = {name.upper() for name in names}
+    for child in element.iter():
+        if _local_name(child.tag).upper() in wanted and _clean_text(child.text):
+            return _clean_text(child.text)
+    return ""
+
+
+def _yes_no(value):
+    text = _clean_text(value).lower()
+    if text in {"yes", "true", "1"}:
+        return True
+    if text in {"no", "false", "0"}:
+        return False
+    return ""
+
+
 def _voucher_type_filter(value):
     if value is None:
         return set()
@@ -1793,6 +2290,25 @@ def _quantity_unit(quantity):
     without_separators = re.sub(r"[/()]", " ", without_numbers)
     unit = re.sub(r"\s+", " ", without_separators).strip()
     return unit or ""
+
+
+def _item_quantity(item):
+    quantity = item.get("quantity", item.get("qty"))
+    unit = _item_unit(item)
+    quantity_text = _clean_text(quantity)
+    if not quantity_text:
+        return ""
+    if unit and not _quantity_unit(quantity_text):
+        return f"{quantity_text} {unit}"
+    return quantity_text
+
+
+def _item_unit(item):
+    return _unit_alias(
+        _clean_text(item.get("stock_item_unit"))
+        or _clean_text(item.get("base_unit"))
+        or _clean_text(item.get("unit"))
+    )
 
 
 def _stock_unit(quantity):
@@ -1865,12 +2381,15 @@ def _tally_date(value, field_name="date"):
     text = str(value).strip()
     numeric_match = re.match(r"^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})$", text)
     if numeric_match:
+        day = int(numeric_match.group(1))
         month = int(numeric_match.group(2))
         year = int(numeric_match.group(3))
         if year < 100:
             year += 2000
-        if 1 <= month <= 12:
-            return datetime(year, month, 1).strftime("%Y%m%d")
+        try:
+            return datetime(year, month, day).strftime("%Y%m%d")
+        except ValueError:
+            pass
 
     normalized_text = (
         text.replace(",", " ")
@@ -1915,7 +2434,7 @@ def _tally_date(value, field_name="date"):
         for date_format in formats:
             try:
                 parsed_date = datetime.strptime(candidate, date_format)
-                return parsed_date.replace(day=1).strftime("%Y%m%d")
+                return parsed_date.strftime("%Y%m%d")
             except ValueError:
                 pass
 

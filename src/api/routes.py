@@ -10,6 +10,7 @@ from services.tally_service import (
     list_tally_accounts,
     list_tally_bank_accounts,
     list_tally_companies,
+    list_tally_stock_items,
     post_to_tally,
 )
 
@@ -46,6 +47,16 @@ def tally_accounts(company_name: str | None = None):
 def tally_bank_accounts(company_name: str | None = None):
     try:
         return list_tally_bank_accounts(company_name)
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@router.get("/tally/stock-items")
+def tally_stock_items(company_name: str | None = None):
+    try:
+        return list_tally_stock_items(company_name)
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     except Exception as error:
