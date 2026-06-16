@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 
@@ -104,6 +105,7 @@ async def extract(
     heading_row: int | None = Form(default=None),
     row_from: int | None = Form(default=None),
     row_to: int | None = Form(default=None),
+    header_mappings: str | None = Form(default=None),
 ):
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_directory:
         file_path = Path(temporary_directory) / file.filename
@@ -114,7 +116,7 @@ async def extract(
         if selected_document_type not in SUPPORTED_DOCUMENT_TYPES:
             raise HTTPException(status_code=400, detail="Unsupported document type.")
 
-        row_options = _spreadsheet_row_options(heading_row, row_from, row_to)
+        row_options = _spreadsheet_row_options(heading_row, row_from, row_to, header_mappings)
 
         try:
             return extract_document(
@@ -127,6 +129,8 @@ async def extract(
                 status_code=504,
                 detail="Document extraction timed out. Try a smaller file or retry the request.",
             ) from error
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
         except Exception as error:
             raise HTTPException(status_code=500, detail=str(error)) from error
 
@@ -145,7 +149,7 @@ async def post_voucher_to_tally(payload: dict):
         raise HTTPException(status_code=500, detail=str(error)) from error
 
 
-def _spreadsheet_row_options(heading_row, row_from, row_to):
+def _spreadsheet_row_options(heading_row, row_from, row_to, header_mappings=None):
     options = {
         "heading_row": heading_row,
         "row_from": row_from,
@@ -158,5 +162,16 @@ def _spreadsheet_row_options(heading_row, row_from, row_to):
 
     if row_from and row_to and row_from > row_to:
         raise HTTPException(status_code=400, detail="row_from cannot be greater than row_to.")
+
+    if header_mappings:
+        try:
+            parsed_header_mappings = json.loads(header_mappings)
+        except json.JSONDecodeError as error:
+            raise HTTPException(status_code=400, detail="header_mappings must be valid JSON.") from error
+
+        if not isinstance(parsed_header_mappings, dict):
+            raise HTTPException(status_code=400, detail="header_mappings must be an object.")
+
+        options["header_mappings"] = parsed_header_mappings
 
     return options
