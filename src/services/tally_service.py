@@ -50,6 +50,8 @@ def post_to_tally(payload):
     source = payload.get("source")
     data = payload.get("data") or {}
     company_name = _clean_text(payload.get("company_name"))
+    if not company_name:
+        raise ValueError("Select a Tally company before posting.")
 
     with _tally_company(company_name):
         return _post_to_tally(document_type, source, data)
@@ -226,7 +228,7 @@ def _tally_company(company_name):
 
 
 def _company_name():
-    return _selected_company.get() or os.environ.get("TALLY_COMPANY_NAME")
+    return _selected_company.get()
 
 
 def _post_vouchers_in_batches(vouchers):
