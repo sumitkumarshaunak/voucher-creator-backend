@@ -1,3 +1,6 @@
+from copy import deepcopy
+
+
 INVOICE_DATA_SCHEMA = {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "title": "TallyVoucher",
@@ -245,6 +248,13 @@ Indian invoices have two common column layouts:
   **Cross-check rule**: taxable_amount × (1 + gst_rate/100) must equal line_total (within ₹1).
   If it doesn't, you have the wrong column — recalculate.
 
+### 5A  Line item completeness
+- Extract every printed invoice item row exactly as present in the input.
+- Count the printed item rows in the input and make `line_items` contain exactly that many entries.
+- Line items may continue across different pages. Include all item rows from all invoice pages in order.
+- Do not merge rows, summarize rows, omit repeated products, or drop continuation-page rows.
+- Do not change printed values. Copy values exactly, except for required number/date normalization.
+
 ### 6  Amounts — copy exactly, do not recompute
 - All amounts are plain numbers (no ₹ symbol, no commas).
 - Copy values **exactly as printed** — do not recalculate or round.
@@ -290,6 +300,122 @@ Indian invoices have two common column layouts:
   4. Does `sum(taxable_amount) ≈ totals.taxable_value`?
   5. Is `freight_amount` 0 unless an LR with a printed freight total is present?
 """
+
+def get_invoice_data_schema(expected_line_item_count=None, medical_invoice=False):
+    schema = deepcopy(INVOICE_DATA_SCHEMA)
+    line_item_schema = schema["properties"]["line_items"]["items"]
+
+    if medical_invoice:
+        line_item_schema["properties"].update(
+            {
+                "expiry_date": {
+                    "type": ["string", "null"],
+                    "description": "Medicine expiry date exactly as printed, e.g. MM/YY, MM/YYYY, or YYYY-MM-DD.",
+                },
+                "batch": {
+                    "type": ["string", "null"],
+                    "description": "Medicine batch number exactly as printed.",
+                },
+                "discount_percentage": {
+                    "type": ["string", "number", "null"],
+                    "description": "Item discount percentage exactly as printed when applicable.",
+                },
+                "discount_amount": {
+                    "type": ["string", "number", "null"],
+                    "description": "Item discount amount exactly as printed.",
+                },
+                "manufacturer": {
+                    "type": ["string", "null"],
+                    "description": "Medicine manufacturer name exactly as printed.",
+                },
+                "packing_type": {
+                    "type": ["string", "null"],
+                    "description": "Packing type/pack size exactly as printed, often the number of units in one pack.",
+                },
+                "scheme%": {
+                    "type": ["string", "number", "null"],
+                    "description": "Scheme percentage exactly as printed, whether percentage or text.",
+                },
+                "free_qty": {
+                    "type": ["string", "number", "null"],
+                    "description": "Free quantity exactly as printed, whether percentage or text.",
+                }
+            }
+        )
+        line_item_schema["required"] = [
+            *line_item_schema["required"],
+            "expiry_date",
+            "batch",
+            "discount_percentage",
+            "discount_amount",
+            "scheme%",
+            "free_qty",
+            "manufacturer",
+            "packing_type",
+        ]
+
+    if not expected_line_item_count:
+        return schema
+
+    schema["required"] = [
+        *schema["required"],
+        "expected_line_item_count",
+        "extracted_line_item_count",
+    ]
+    schema["properties"]["expected_line_item_count"] = {
+        "type": "integer",
+        "const": expected_line_item_count,
+        "description": "User-provided expected number of printed invoice item rows.",
+    }
+    schema["properties"]["extracted_line_item_count"] = {
+        "type": "integer",
+        "const": expected_line_item_count,
+        "description": "Number of entries returned in line_items. Must equal expected_line_item_count.",
+    }
+    return schema
+
+
+def get_invoice_system_prompt(expected_line_item_count=None, medical_invoice=False):
+    extra_instructions = []
+
+    if medical_invoice:
+        extra_instructions.append(
+            """
+### Medical invoice line item fields
+The user has marked this as a medical/pharma invoice.
+- For every `line_items` entry, also extract the following fields:
+  - `expiry_date`: Medicine expiry exactly as printed. Look under columns labeled "EXP", "EXPIRY", or similar variants.
+  - `batch`: Batch/lot number exactly as printed.
+  - `discount_percentage`: Item-level discount percentage exactly as printed, if present.
+  - `discount_amount`: Item-level discount amount exactly as printed, if present.
+  - `scheme%`: Scheme/bonus percentage exactly as printed, if present.
+  - `free_qty`: Free quantity exactly as printed, if present.
+  - `manufacturer`: Medicine manufacturer exactly as printed. Look under columns labeled "MFG", "MANUFACTURER", or similar variants.
+  - `packing_type`: Pack size or type exactly as printed (often the count of units per pack). Look under columns labeled "PACK", "PACKING", or similar variants.
+- Set any genuinely absent field to `null`. Do not guess or infer missing values.
+- Do not normalize, convert, or reformat values — trim leading/trailing whitespace only.
+"""
+        )
+
+    if expected_line_item_count:
+        extra_instructions.append(
+            f"""
+### Explicit line item count validation
+The user has provided expected_line_item_count = {expected_line_item_count}.
+- Extract every line item from the complete input.
+- Count the extracted line items.
+- If the count is not {expected_line_item_count}, re-read the input and find the missing or extra rows.
+- Return exactly {expected_line_item_count} entries in `line_items`.
+- Set `expected_line_item_count` to {expected_line_item_count}.
+- Set `extracted_line_item_count` to {expected_line_item_count}.
+- Do not merge rows, summarize rows, omit repeated products, or alter any printed value.
+"""
+        )
+
+    if not extra_instructions:
+        return INVOICE_SYSTEM_PROMPT
+
+    return INVOICE_SYSTEM_PROMPT.rstrip() + "\n".join(extra_instructions)
 
 
 BANK_STATEMENT_SYSTEM_PROMPT = """

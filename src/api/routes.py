@@ -105,6 +105,8 @@ async def extract(
     heading_row: int | None = Form(default=None),
     row_from: int | None = Form(default=None),
     row_to: int | None = Form(default=None),
+    expected_line_item_count: int | None = Form(default=None),
+    medical_invoice: bool = Form(default=False),
     header_mappings: str | None = Form(default=None),
 ):
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary_directory:
@@ -116,7 +118,14 @@ async def extract(
         if selected_document_type not in SUPPORTED_DOCUMENT_TYPES:
             raise HTTPException(status_code=400, detail="Unsupported document type.")
 
-        row_options = _spreadsheet_row_options(heading_row, row_from, row_to, header_mappings)
+        row_options = _extract_options(
+            heading_row,
+            row_from,
+            row_to,
+            expected_line_item_count,
+            medical_invoice,
+            header_mappings,
+        )
 
         try:
             return extract_document(
@@ -149,14 +158,25 @@ async def post_voucher_to_tally(payload: dict):
         raise HTTPException(status_code=500, detail=str(error)) from error
 
 
-def _spreadsheet_row_options(heading_row, row_from, row_to, header_mappings=None):
+def _extract_options(
+    heading_row,
+    row_from,
+    row_to,
+    expected_line_item_count=None,
+    medical_invoice=False,
+    header_mappings=None,
+):
     options = {
         "heading_row": heading_row,
         "row_from": row_from,
         "row_to": row_to,
+        "expected_line_item_count": expected_line_item_count,
+        "medical_invoice": medical_invoice,
     }
 
     for label, value in options.items():
+        if isinstance(value, bool):
+            continue
         if value is not None and value < 1:
             raise HTTPException(status_code=400, detail=f"{label} must be greater than zero.")
 

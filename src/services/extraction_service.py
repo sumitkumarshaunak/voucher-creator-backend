@@ -36,6 +36,7 @@ def extract_document(file_path, document_type=None, row_options=None):
         return invoice_extractor.extract_file(
             file_path,
             document_type=selected_document_type,
+            row_options=row_options,
         )
 
     raise ValueError("Unsupported document type.")
