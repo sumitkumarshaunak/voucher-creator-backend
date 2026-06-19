@@ -15,7 +15,11 @@ def get_openai_client(api_key=None):
 def build_json_instructions(system_prompt, data_schema):
     return (
         system_prompt.strip()
-        + "\n\nReturn JSON conforming exactly to this schema:\n"
+        + "\n\nReturn the extracted document DATA as JSON. Do not return the schema itself.\n"
+        + "Never include schema-only keys such as `type`, `properties`, `required`, "
+        + "`additionalProperties`, `description`, or `items` in the output unless they are "
+        + "explicit business fields inside the document data.\n"
+        + "The required output shape is described by this JSON Schema:\n"
         + json.dumps(data_schema, indent=2)
     )
 
@@ -57,6 +61,7 @@ def call_llm(
         request["text"] = {"format": {"type": "json_object"}}
 
     raw = openai_client.responses.create(**request)
+    print(f"LLM tokens used: {raw.usage}")
 
     if not json_response:
         return raw.output_text

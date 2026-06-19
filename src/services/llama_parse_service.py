@@ -1,4 +1,5 @@
 import os
+from prompts import LLAMA_PROMPT_TEMPLATE
 
 from llama_cloud import LlamaCloud
 
@@ -6,6 +7,10 @@ from llama_cloud import LlamaCloud
 PARSE_CONFIGURATION = {
     "tier": "cost_effective",
     "version": "latest",
+    "disable_cache": True,
+    "agentic_options": {
+      "custom_prompt": LLAMA_PROMPT_TEMPLATE
+    },
     "output_options": {
         "markdown": {
             "tables": {
@@ -19,6 +24,13 @@ PARSE_CONFIGURATION = {
             "preserve_layout_alignment_across_pages": True,
             "preserve_very_small_text": True,
         },
+    },
+    "processing_options": {
+        "ignore": {
+            "ignore_diagonal_text": True,
+            "ignore_text_in_image": True,
+            "ignore_hidden_text": True
+        }
     },
     "expand": ["markdown_full", "text_full"],
 }
