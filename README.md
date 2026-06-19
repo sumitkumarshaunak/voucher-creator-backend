@@ -25,15 +25,23 @@ cd voucher-creator
 
 ```bash
 cd voucher-creator
-.venv/bin/python -m uvicorn server:app --app-dir src --host 127.0.0.1 --port 8000
+.venv/bin/python -m uvicorn server:app --app-dir src --host 0.0.0.0 --port 8000
 ```
 
 `server:app` is kept as a compatibility entrypoint. The app is created in `src/app.py`.
+You can also run `python src/server.py`; it uses `BACKEND_HOST` and `BACKEND_PORT`
+from `.env`, defaulting to `0.0.0.0:8000`.
 
 ## Check
 
 ```bash
 curl http://127.0.0.1:8000/health
+```
+
+From another device on the same network, use this computer's LAN IP instead, for example:
+
+```bash
+curl http://192.168.1.25:8000/health
 ```
 
 Expected response:
@@ -42,7 +50,8 @@ Expected response:
 {"status":"ok"}
 ```
 
-The frontend is configured to call `http://127.0.0.1:8000`.
+The frontend running on another device must use this computer's LAN IP for
+`VITE_API_BASE_URL`, for example `http://192.168.1.25:8000`.
 
 ## Tally Posting
 
