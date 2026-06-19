@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from config import load_backend_env
@@ -14,10 +15,13 @@ load_backend_env()
 INVOICE_JSON_MODEL = os.environ.get("INVOICE_JSON_MODEL", "gpt-4o-mini")
 INVOICE_MARKDOWN_DEBUG_FILE = os.environ.get("INVOICE_MARKDOWN_DEBUG_FILE", "last-invoice-markdown.md")
 INVOICE_PAGE_JSON_DEBUG_FILE = os.environ.get("INVOICE_PAGE_JSON_DEBUG_FILE", "last-invoice-page-json.json")
+INVOICE_PARSE_MAX_WORKERS = int(os.environ.get("INVOICE_PARSE_MAX_WORKERS", "5"))
+INVOICE_LLM_MAX_WORKERS = int(os.environ.get("INVOICE_LLM_MAX_WORKERS", "5"))
 PAGE_META_DELIMITER = "---PAGE_META---"
 
 BANK_STATEMENT_EXTENSIONS = {".xls", ".xlsx"}
 PDF_EXTENSIONS = {".pdf"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 SUPPORTED_DOCUMENT_TYPES = {"invoice"}
 
 
@@ -90,27 +94,18 @@ def _unwrap_schema_shaped_result(result):
     return result
 
 
-def _append_page_json_debug(page, result, normalized_result=None):
-    debug_path = Path(INVOICE_PAGE_JSON_DEBUG_FILE)
-    existing = []
-    if debug_path.exists():
-        try:
-            existing = json.loads(debug_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            existing = []
+def _page_json_debug_entry(page, result, normalized_result=None):
+    return {
+        "page_number": (page.get("meta") or {}).get("page_number"),
+        "page_meta": page.get("meta") or {},
+        "result": result,
+        "normalized_result": normalized_result,
+    }
 
-    if not isinstance(existing, list):
-        existing = []
 
-    existing.append(
-        {
-            "page_number": (page.get("meta") or {}).get("page_number"),
-            "page_meta": page.get("meta") or {},
-            "result": result,
-            "normalized_result": normalized_result,
-        }
-    )
-    _write_json_debug_file(debug_path, existing)
+def _write_page_json_debug_entries(entries):
+    sorted_entries = sorted(entries, key=lambda entry: entry.get("page_number") or 0)
+    _write_json_debug_file(INVOICE_PAGE_JSON_DEBUG_FILE, sorted_entries)
 
 
 def _split_markdown_page_blocks(markdown):
@@ -144,6 +139,10 @@ def _split_markdown_page_blocks(markdown):
     return pages
 
 
+def _worker_count(item_count, configured_workers):
+    return max(1, min(item_count, configured_workers))
+
+
 def _patched_page_markdown(page_markdown, page_meta=None, page_number=1, page_count=1):
     meta = dict(page_meta or {})
     meta["page_number"] = page_number
@@ -175,41 +174,76 @@ def _markdown_pages_from_full_markdown(markdown):
     ]
 
 
+def _page_from_parsed_document(parsed, page_number, page_count):
+    raw_markdown = parsed["markdown"] or parsed["text"]
+    page_blocks = _split_markdown_page_blocks(raw_markdown)
+
+    if page_blocks:
+        page_markdown = page_blocks[0]["markdown"]
+        page_meta = page_blocks[0]["meta"]
+    else:
+        page_markdown = raw_markdown
+        page_meta = {}
+
+    return {
+        "raw_markdown": raw_markdown,
+        "raw_text": parsed["text"] or "",
+        "markdown": _patched_page_markdown(
+            page_markdown,
+            page_meta=page_meta,
+            page_number=page_number,
+            page_count=page_count,
+        ),
+        "meta": {**page_meta, "page_number": page_number, "page_count": page_count},
+    }
+
+
+def _parse_document_page(file_path, page_number, page_count, api_key=None):
+    parsed = parse_document(file_path, api_key=api_key)
+    return _page_from_parsed_document(parsed, page_number, page_count)
+
+
 def _markdown_pages_from_pdf_pages(file_path, api_key=None):
     page_batches = pdf_page_batches(file_path, pages_per_batch=1)
     page_count = len(page_batches)
-    pages = []
+    pages_by_number = {}
 
     try:
-        for index, (_, page_path) in enumerate(page_batches, start=1):
-            parsed = parse_document(page_path, api_key=api_key)
-            raw_markdown = parsed["markdown"] or parsed["text"]
-            page_blocks = _split_markdown_page_blocks(raw_markdown)
-
-            if page_blocks:
-                page_markdown = page_blocks[0]["markdown"]
-                page_meta = page_blocks[0]["meta"]
-            else:
-                page_markdown = raw_markdown
-                page_meta = {}
-
-            pages.append(
-                {
-                    "raw_markdown": raw_markdown,
-                    "markdown": _patched_page_markdown(
-                        page_markdown,
-                        page_meta=page_meta,
-                        page_number=index,
-                        page_count=page_count,
-                    ),
-                    "meta": {**page_meta, "page_number": index, "page_count": page_count},
-                }
-            )
+        with ThreadPoolExecutor(max_workers=_worker_count(page_count, INVOICE_PARSE_MAX_WORKERS)) as executor:
+            futures = {
+                executor.submit(_parse_document_page, page_path, index, page_count, api_key): index
+                for index, (_, page_path) in enumerate(page_batches, start=1)
+            }
+            for future in as_completed(futures):
+                page_number = futures[future]
+                try:
+                    pages_by_number[page_number] = future.result()
+                except Exception as error:
+                    raise RuntimeError(f"LlamaParse failed for invoice page {page_number}.") from error
     finally:
         for _, page_path in page_batches:
             page_path.unlink(missing_ok=True)
 
-    return pages
+    return [pages_by_number[index] for index in sorted(pages_by_number)]
+
+
+def _markdown_pages_from_image_files(file_paths, api_key=None):
+    page_count = len(file_paths)
+    pages_by_number = {}
+
+    with ThreadPoolExecutor(max_workers=_worker_count(page_count, INVOICE_PARSE_MAX_WORKERS)) as executor:
+        futures = {
+            executor.submit(_parse_document_page, file_path, index, page_count, api_key): index
+            for index, file_path in enumerate(file_paths, start=1)
+        }
+        for future in as_completed(futures):
+            page_number = futures[future]
+            try:
+                pages_by_number[page_number] = future.result()
+            except Exception as error:
+                raise RuntimeError(f"LlamaParse failed for invoice image page {page_number}.") from error
+
+    return [pages_by_number[index] for index in sorted(pages_by_number)]
 
 
 def _extract_invoice_json(
@@ -321,7 +355,6 @@ def _merge_page_invoice_jsons(page_results, expected_line_item_count=None):
     for result in normalized_results:
         for item in result.get("line_items") or result.get("items") or []:
             next_item = dict(item)
-            next_item["sl_no"] = len(line_items) + 1
             line_items.append(next_item)
         other_charges.extend(result.get("other_charges") or [])
 
@@ -363,9 +396,9 @@ def _validate_page_result(page, result):
         )
 
 
-def _extract_invoice_from_pages(pages, api_key=None, expected_line_item_count=None, medical_invoice=False):
-    page_results = []
-    for page in pages:
+def _extract_invoice_page_result(page, api_key=None, medical_invoice=False):
+    page_number = (page.get("meta") or {}).get("page_number") or "unknown"
+    try:
         page_result = _extract_invoice_json(
             page["markdown"],
             "",
@@ -375,13 +408,48 @@ def _extract_invoice_from_pages(pages, api_key=None, expected_line_item_count=No
             page_mode=True,
         )
         normalized_page_result = _unwrap_schema_shaped_result(page_result)
-        _append_page_json_debug(page, page_result, normalized_result=normalized_page_result)
         _validate_page_result(page, normalized_page_result)
-        page_results.append(normalized_page_result)
+        return {
+            "page": page,
+            "page_number": page_number,
+            "result": page_result,
+            "normalized_result": normalized_page_result,
+        }
+    except Exception as error:
+        raise RuntimeError(f"LLM invoice extraction failed for page {page_number}.") from error
+
+
+def _extract_invoice_from_pages(pages, api_key=None, expected_line_item_count=None, medical_invoice=False):
+    sorted_pages = sorted(pages, key=lambda page: (page.get("meta") or {}).get("page_number") or 0)
+    page_outputs_by_number = {}
+
+    with ThreadPoolExecutor(max_workers=_worker_count(len(sorted_pages), INVOICE_LLM_MAX_WORKERS)) as executor:
+        futures = {
+            executor.submit(_extract_invoice_page_result, page, api_key, medical_invoice): (
+                page.get("meta") or {}
+            ).get("page_number")
+            for page in sorted_pages
+        }
+        for future in as_completed(futures):
+            page_output = future.result()
+            page_outputs_by_number[page_output["page_number"]] = page_output
+
+    page_outputs = [page_outputs_by_number[page_number] for page_number in sorted(page_outputs_by_number)]
+    page_results = [page_output["normalized_result"] for page_output in page_outputs]
+    _write_page_json_debug_entries(
+        [
+            _page_json_debug_entry(
+                page_output["page"],
+                page_output["result"],
+                normalized_result=page_output["normalized_result"],
+            )
+            for page_output in page_outputs
+        ]
+    )
 
     return _merge_page_invoice_jsons(page_results, expected_line_item_count=expected_line_item_count), {
         "page_llm_calls": len(page_results),
-        "page_meta": [page["meta"] for page in pages],
+        "page_meta": [page["meta"] for page in sorted_pages],
     }
 
 
@@ -397,15 +465,20 @@ def extract_file(file_path, document_type=None, api_key=None, openai_api_key=Non
     expected_line_item_count = row_options.get("expected_line_item_count")
     medical_invoice = bool(row_options.get("medical_invoice"))
 
-    parsed = parse_document(file_path, api_key=api_key)
     _reset_page_json_debug_file()
+    parsed = None
     if file_path.suffix.lower() in PDF_EXTENSIONS:
         pages = _markdown_pages_from_pdf_pages(file_path, api_key=api_key)
+        markdown_chars = sum(len(page.get("raw_markdown", "")) for page in pages)
+        text_chars = sum(len(page.get("raw_text", "")) for page in pages)
         _write_text_debug_file(
             INVOICE_MARKDOWN_DEBUG_FILE,
             "".join(page.get("raw_markdown", "") for page in pages),
         )
     else:
+        parsed = parse_document(file_path, api_key=api_key)
+        markdown_chars = len(parsed["markdown"])
+        text_chars = len(parsed["text"])
         _write_text_debug_file(INVOICE_MARKDOWN_DEBUG_FILE, parsed["markdown"])
         pages = _markdown_pages_from_full_markdown(parsed["markdown"])
 
@@ -417,6 +490,8 @@ def extract_file(file_path, document_type=None, api_key=None, openai_api_key=Non
             medical_invoice=medical_invoice,
         )
     else:
+        if parsed is None:
+            raise RuntimeError("No invoice pages were parsed from this PDF.")
         result = _unwrap_schema_shaped_result(_extract_invoice_json(
             parsed["markdown"],
             parsed["text"],
@@ -430,9 +505,69 @@ def extract_file(file_path, document_type=None, api_key=None, openai_api_key=Non
         "document_type": selected_document_type,
         "result": result,
         "metadata": {
-            "markdown_chars": len(parsed["markdown"]),
-            "text_chars": len(parsed["text"]),
+            "markdown_chars": markdown_chars,
+            "text_chars": text_chars,
             "json_model": INVOICE_JSON_MODEL,
+            "source_file_count": 1,
+            "expected_line_item_count": expected_line_item_count,
+            "medical_invoice": medical_invoice,
+            **page_metadata,
+        },
+    }
+
+
+def extract_files(file_paths, document_type=None, api_key=None, openai_api_key=None, row_options=None):
+    file_paths = [Path(file_path) for file_path in file_paths]
+    if not file_paths:
+        raise ValueError("At least one invoice image is required.")
+
+    missing_paths = [str(file_path) for file_path in file_paths if not file_path.exists()]
+    if missing_paths:
+        raise FileNotFoundError(f"File does not exist: {missing_paths[0]}")
+
+    selected_document_type = document_type or infer_document_type(file_paths[0])
+    if selected_document_type != "invoice":
+        raise RuntimeError("Multiple-file extraction is supported for invoice images only.")
+
+    non_image_files = [
+        file_path.name
+        for file_path in file_paths
+        if file_path.suffix.lower() not in IMAGE_EXTENSIONS
+    ]
+    if non_image_files:
+        raise ValueError("Multiple-file invoice extraction supports image files only.")
+
+    row_options = row_options or {}
+    expected_line_item_count = row_options.get("expected_line_item_count")
+    medical_invoice = bool(row_options.get("medical_invoice"))
+
+    _reset_page_json_debug_file()
+    pages = _markdown_pages_from_image_files(file_paths, api_key=api_key)
+    if len(pages) != len(file_paths):
+        raise RuntimeError(
+            f"Expected {len(file_paths)} parsed image page(s), but built {len(pages)} page(s)."
+        )
+
+    _write_text_debug_file(
+        INVOICE_MARKDOWN_DEBUG_FILE,
+        "".join(page.get("raw_markdown", "") for page in pages),
+    )
+
+    result, page_metadata = _extract_invoice_from_pages(
+        pages,
+        api_key=openai_api_key,
+        expected_line_item_count=expected_line_item_count,
+        medical_invoice=medical_invoice,
+    )
+
+    return {
+        "document_type": selected_document_type,
+        "result": result,
+        "metadata": {
+            "markdown_chars": sum(len(page.get("raw_markdown", "")) for page in pages),
+            "text_chars": sum(len(page.get("raw_text", "")) for page in pages),
+            "json_model": INVOICE_JSON_MODEL,
+            "source_file_count": len(file_paths),
             "expected_line_item_count": expected_line_item_count,
             "medical_invoice": medical_invoice,
             **page_metadata,

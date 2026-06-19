@@ -40,3 +40,19 @@ def extract_document(file_path, document_type=None, row_options=None):
         )
 
     raise ValueError("Unsupported document type.")
+
+
+def extract_documents(file_paths, document_type=None, row_options=None):
+    if not file_paths:
+        raise ValueError("At least one file is required.")
+
+    selected_document_type = document_type or infer_document_type(file_paths[0])
+
+    if selected_document_type != "invoice":
+        raise ValueError("Multiple-file extraction is supported for invoice images only.")
+
+    return invoice_extractor.extract_files(
+        file_paths,
+        document_type=selected_document_type,
+        row_options=row_options,
+    )
