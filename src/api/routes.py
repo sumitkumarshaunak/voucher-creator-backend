@@ -113,6 +113,7 @@ async def tally_account(payload: dict):
 async def extract(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
     document_type = _optional_form_str(form, "document_type")
+    source = _optional_form_str(form, "source")
     heading_row = _optional_form_int(form, "heading_row")
     row_from = _optional_form_int(form, "row_from")
     row_to = _optional_form_int(form, "row_to")
@@ -156,6 +157,7 @@ async def extract(request: Request, background_tasks: BackgroundTasks):
         job_id = create_extraction_job(
             {
                 "document_type": selected_document_type,
+                "source": source,
                 "row_options": row_options,
                 "file_count": len(upload_files),
                 "filenames": [upload_file.filename for upload_file in upload_files],
@@ -181,6 +183,7 @@ async def extract(request: Request, background_tasks: BackgroundTasks):
         files_field_count=len(files_field_uploads),
         client_file_count=client_file_count,
         job_id=job_id,
+        source=source,
     )
 
     background_tasks.add_task(
@@ -324,11 +327,13 @@ def _write_upload_debug(
     files_field_count=0,
     client_file_count=None,
     job_id=None,
+    source=None,
 ):
     UPLOAD_DEBUG_FILE.write_text(
         json.dumps(
             {
                 "document_type": document_type,
+                "source": source,
                 "job_id": job_id,
                 "file_field_count": file_field_count,
                 "files_field_count": files_field_count,
