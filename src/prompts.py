@@ -89,7 +89,6 @@ INVOICE_DATA_SCHEMA = {
                     "taxable_amount",
                     "gst_rate",
                     "line_total",
-                    "line_total_reasoning",
                 ],
                 "additionalProperties": True,
                 "properties": {
@@ -112,18 +111,6 @@ INVOICE_DATA_SCHEMA = {
                     "line_total": {
                     "type": ["number", "null"],
                     "description": "Post-tax total amount for the line item. Calculated as taxable_amount + CGST + SGST + IGST + Cess. Represents the item's total contribution to the invoice grand total. Only extract if a dedicated LINE_TOTAL column exists and is confirmed as post-tax; otherwise null. Do not compute from taxable_amount + tax amounts."
-                    },
-                    "line_total_reasoning": {
-                        "type": "string",
-                        "description": (
-                            "How line_total was determined. "
-                            "Use exactly one of: "
-                            "'extracted from LINE_TOTAL column', "
-                            "'null because no LINE_TOTAL column exists', "
-                            "'null because candidate amount columns are pre-tax amounts (GROSS_AMT/TAXABLE_AMT) based on arithmetic validation'. "
-                            "If line_total_reasoning starts with 'null because', then line_total MUST be null. "
-                            "Never use invoice totals, footer totals, taxable totals, or grand totals as line_total values."
-                        )
                     },
                     "gross_amount": {
                         "type": ["number", "null"],
