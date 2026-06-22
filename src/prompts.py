@@ -87,33 +87,19 @@ INVOICE_DATA_SCHEMA = {
                     "unit",
                     "rate",
                     "taxable_amount",
-                    "discount_percentage",
-                    "discount_amount",
                     "gst_rate",
-                    "igst_amount",
-                    "cgst_amount",
-                    "sgst_amount",
-                    "cess_amount",
                     "line_total",
+                    "line_total_reasoning",
                 ],
-                "additionalProperties": False,
+                "additionalProperties": True,
                 "properties": {
                     "sl_no":          {"type": "integer", "minimum": 1},
                     "description":    {"type": "string", "description": "Item description as printed."},
                     "hsn":            {"type": "string", "description": "HSN code for goods, SAC for services."},
-                    "qty":            {"type": ["number", "null"]},
+                    "qty":            {"type": ["number", "null"], "description": "Quantity of items on which rate and tax are applied."},
                     "unit":           {"type": ["string", "null"], "description": "e.g. MT, KG, NOS."},
                     "rate":           {"type": ["number", "null"], "description": "Price per unit before tax."},
-                    "taxable_amount": {
-                        "type": "number",
-                        "description": (
-                            "Pre-tax subtotal for this line = qty × rate minus any discount. "
-                            "IMPORTANT: Many invoice formats show a combined Amount() column that includes tax — "
-                            "do NOT use that column as taxable_amount. "
-                            "The taxable_amount is always the value BEFORE GST is added. "
-                            "Verify: taxable_amount × (1 + gst_rate/100) ≈ line_total."
-                        )
-                    },
+                    "taxable_amount": {"type": "number", "description": "The taxable_amount is always the value BEFORE GST is added. "},
                     "discount_amount": {
                         "type": ["number", "null"],
                         "description": "Item discount amount only from an explicit discount amount column; otherwise null. Never use scheme/free/bonus values here.",
@@ -123,17 +109,53 @@ INVOICE_DATA_SCHEMA = {
                         "description": "Item discount percentage only from an explicit discount percentage/cash discount column; otherwise null. Never use scheme/free/bonus percentage or values here.",
                     },
                     "gst_rate":        {"type": "number", "description": "Total GST % e.g. 18."},
-                    "igst_amount":     {"type": "number", "default": 0, "description": "0 if intra-state."},
-                    "cgst_amount":     {"type": "number", "default": 0, "description": "0 if inter-state."},
-                    "sgst_amount":     {"type": "number", "default": 0, "description": "0 if inter-state."},
-                    "cess_amount":     {"type": "number", "default": 0},
-                    "line_total":      {
-                        "type": "number",
+                    "line_total": {
+                    "type": ["number", "null"],
+                    "description": "Post-tax total amount for the line item. Calculated as taxable_amount + CGST + SGST + IGST + Cess. Represents the item's total contribution to the invoice grand total. Only extract if a dedicated LINE_TOTAL column exists and is confirmed as post-tax; otherwise null. Do not compute from taxable_amount + tax amounts."
+                    },
+                    "line_total_reasoning": {
+                        "type": "string",
                         "description": (
-                            "taxable_amount + igst_amount + cgst_amount + sgst_amount + cess_amount for this line. "
-                            "Copy directly from the printed Amount() column if available, preserving all decimal places. "
-                            "Rounding off is applied at the invoice level, not per line."
+                            "How line_total was determined. "
+                            "Use exactly one of: "
+                            "'extracted from LINE_TOTAL column', "
+                            "'null because no LINE_TOTAL column exists', "
+                            "'null because candidate amount columns are pre-tax amounts (GROSS_AMT/TAXABLE_AMT) based on arithmetic validation'. "
+                            "If line_total_reasoning starts with 'null because', then line_total MUST be null. "
+                            "Never use invoice totals, footer totals, taxable totals, or grand totals as line_total values."
                         )
+                    },
+                    "gross_amount": {
+                        "type": ["number", "null"],
+                        "description": "The value before any discounts or GST. Copy from a Gross Amount / Basic Amount column if it exists; otherwise null."
+                    },
+                    "expiry_date": {
+                        "type": ["string", "null"],
+                        "description": "Medicine expiry date exactly as printed, e.g. MM/YY, MM/YYYY, or YYYY-MM-DD.",
+                    },
+                    "batch": {
+                        "type": ["string", "null"],
+                        "description": "Medicine batch number exactly as printed.",
+                    },
+                    "manufacturer": {
+                        "type": ["string", "null"],
+                        "description": "Medicine manufacturer name exactly as printed.",
+                    },
+                    "packing_type": {
+                        "type": ["string", "null"],
+                        "description": "Packing type/pack size exactly as printed, often the number of units in one pack.",
+                    },
+                    "scheme%": {
+                        "type": ["string", "number", "null"],
+                        "description": "Medicine scheme/bonus percentage exactly as printed only from a separate Scheme/Sch/Bonus column; otherwise null. Never copy discount percentage here.",
+                    },
+                    "free_qty": {
+                        "type": ["string", "number", "null"],
+                        "description": "Free/bonus quantity exactly as printed only from a separate Free/Bonus quantity column; otherwise null. Never copy discount percentage here.",
+                    },
+                    "mrp": {
+                        "type": ["string", "number", "null"],
+                        "description": "Maximum retail price of the item as printed."
                     }
                 }
             }
@@ -155,9 +177,6 @@ INVOICE_DATA_SCHEMA = {
                     "hsn":         {"type": "string"},
                     "amount":      {"type": "number"},
                     "gst_rate":    {"type": "number", "default": 0},
-                    "igst_amount": {"type": "number", "default": 0},
-                    "cgst_amount": {"type": "number", "default": 0},
-                    "sgst_amount": {"type": "number", "default": 0}
                 }
             }
         },
@@ -226,159 +245,261 @@ INVOICE_DATA_SCHEMA = {
 
 
 INVOICE_SYSTEM_PROMPT = """
-You are a GST invoice data extraction specialist for Indian businesses. The invoice you are
-processing may be from any industry — steel trading, medical/pharma distribution, construction
-materials, chemicals, FMCG, or any other sector. Adapt your extraction to the specific invoice
-format and line item fields present in the input.
+You are a GST invoice data extraction specialist for Indian businesses. Read one invoice page and output a single JSON object matching the provided schema. Accuracy is paramount — a missing or null value is always better than a hallucinated or wrongly assigned one. Output ONLY valid JSON, no preamble, no explanation.
 
-Your task: read ONE PAGE of a parsed invoice (markdown table + PAGE_META JSON) and output a
-single PageLineItems JSON object for that page only. Multiple page outputs will be merged
-downstream — do NOT wait for other pages or attempt to produce a full invoice summary.
-
-The JSON will be consumed by a program that posts a voucher to TallyPrime via XML import —
-accuracy is critical.
+If PAGE_META.page_type ≠ tax_invoice → output {"skip": true, "reason": "<page_type>"} and stop.
 
 ---
 
-## INPUT FORMAT
-Each input contains two sections separated by `---PAGE_META---`:
-1. **Markdown section** — the parsed invoice page as a markdown table.
-2. **PAGE_META section** — a JSON object pre-computed by the parser with:
-   - `page_number`
-   - `page_type`: tax_invoice | eway_bill | lr_consignment | other
-   - `item_count_this_page`: data rows the parser counted on this page
-   - `item_serial_numbers`: exact list of S.No values the parser saw
-   - `first_sno_this_page` / `last_sno_this_page`: S.No range for this page
-   - `bf_amount`: carry-forward subtotal at top of page (null on page 1)
-   - `has_grand_total`: true only on the final invoice page
-   - `printed_total_items`: the "TOTAL ITEMS : N" footer value, if present
+## PHASE R — READ THE FULL PAGE BEFORE EXTRACTING ANYTHING
 
-**PAGE_META is your ground truth for row count. Extract exactly `item_count_this_page` rows.**
+### R1: Identify every column header exactly as printed
+List all column headers left-to-right, including two-row spanning headers. Record the exact text and position of each.
 
----
+### R2: Classify every column
+Assign each column to exactly one type: SERIAL | DESCRIPTION | CODE | QUANTITY | UNIT_LABEL | RATE | PERCENTAGE | GROSS_AMT | TAXABLE_AMT | TAX_AMT | LINE_TOTAL | DATE_FIELD | MRP_FIELD | TEXT_INFO.
 
-## EXTRACTION RULES
+### R3: Resolve amount columns
+Use header text first:
 
-### 1  invoice_header
-- Populate only when `PAGE_META.bf_amount` is null (first invoice page). Set to null on all continuation pages.
-- Extract from the header section above the item table:
-  - `invoice_no`: exactly as printed
-  - `invoice_date`: normalize to YYYY-MM-DD
-  - `payment_mode`: exactly as printed
-  - `supplier_name`, `supplier_gstin`: issuing party
-  - `buyer_name`, `buyer_gstin`: bill-to party (buyer_gstin null if absent)
-  - `supply_type`: "Intra-State" or "Inter-State" (see Rule 3)
+| Header contains | Type |
+|---|---|
+| Gross / Basic Amount / Gross Total | GROSS_AMT |
+| Net Amount / Taxable / Net Taxable / Assessable Value | TAXABLE_AMT |
+| CGST/SGST/IGST Amount / Tax Amount | TAX_AMT |
+| Total Amount / Invoice Value / Net Value / Amount() | LINE_TOTAL |
 
-### 2  GST supply type
-- Compare first 2 digits of `supplier_gstin` vs `buyer_gstin`.
-- If buyer GSTIN is absent → default to Intra-State.
-- Same state code → **Intra-State** → per line: `cgst_amount` = `sgst_amount` = taxable_amount × (gst_rate / 2 / 100); `igst_amount` = 0.
-- Different state codes → **Inter-State** → per line: `igst_amount` = taxable_amount × (gst_rate / 100); `cgst_amount` = `sgst_amount` = 0.
+When the header is ambiguous, use arithmetic on multiple representative rows:
 
-### 3  invoice_footer
-- Populate only when `PAGE_META.has_grand_total` is true. Set to null on all other pages.
-- Extract from the summary section below the item table:
-  - `taxable_value`, `total_igst`, `total_cgst`, `total_sgst`, `total_cess`: as printed, 0 if absent
-  - `total_other_charges`: 0 if absent
-  - `rounding_off`: positive if "Add: Rounded Off (+)", negative if "Less: Rounded Off (-)", 0 if absent
-  - `grand_total`: copy exactly as printed — do NOT recompute; verify against `amount_in_words`
-  - `amount_in_words`: exactly as printed
-  - `transport` (all fields null/0 if absent):
-    - `transporter`, `vehicle_no`, `lr_no`, `lr_date` (YYYY-MM-DD)
-    - `freight_terms`: exactly as printed, default "To Pay"
-    - `freight_amount`: from LR/bilty only; 0 if no LR freight amount is printed
+- candidate ≈ qty × rate
+  → GROSS_AMT
+  (or TAXABLE_AMT if no discount/taxable column exists)
 
-### 5  Column layout — identify once per page before reading any row
-Read the header row of the item table and map each column to its schema field.
-Column names vary by invoice type — use the closest match from the variants below:
+- candidate ≈ gross_amount − discount_amount
+  → TAXABLE_AMT
 
-| Schema field       | Common column name variants                          |
-|--------------------|------------------------------------------------------|
-| `sl_no`            | S.N., Sr., No., #                                    |
-| `hsn`              | HSN, HSN/SAC, HSN Code                               |
-| `description`      | ITEM NAME, Description, Particulars, Material        |
-| `qty`              | QTY, Quantity, Nos, MT, KG                           |
-| `unit`             | Unit, UOM — infer from pack/qty if absent            |
-| `rate`             | RATE, Price, Unit Price                              |
-| `discount_percentage` | Disc %, Discount %, DIS. %, CD % — null if absent |
-| `discount_amount`  | Disc. Amt, Discount Amt, Discount Value — null if absent |
-| `gst_rate`         | GST, GST%, IGST Rate, Tax Rate — strip %             |
-| `line_total`       | TAX AMT., Amount(), Total, Net Amt — copy exactly    |
+- candidate ≈ taxable_amount + tax_amount
+  OR
+  candidate ≈ taxable_amount × (1 + GST%)
+  → LINE_TOTAL
 
-If a column is absent, use null for strings and nullable numbers; use 0 only for GST/tax amounts that are absent.
-**line_total always includes GST — never assign it directly to `taxable_amount`.**
+A column cannot be LINE_TOTAL if:
+- candidate ≈ qty × rate
+- candidate ≈ gross_amount − discount_amount
 
-### Discount vs Scheme — never conflate these two fields
+The line_items section is row-scoped. All line-item fields, including line_total, must be extracted only from values printed on the same item row.
+Do not use invoice-level values such as Grand Total, Taxable Value, Subtotal, footer tax totals, amount-in-words totals, or any other footer totals when populating line-item fields.Prefer matches that are consistent across multiple rows rather than a single row.
+If taxes appear only in the footer (no per-row TAX_AMT columns), do not assume a LINE_TOTAL column exists. Any per-row amount column must be classified as GROSS_AMT or TAXABLE_AMT using arithmetic validation. Set line_total only when a dedicated printed post-tax amount column exists.
+Footer cross-check: Σ taxable_amount across all rows must ≈ printed footer taxable total. If not, reclassify the amount columns before continuing.
 
-- `discount_percentage`: map ONLY from a column explicitly labelled Disc %, Discount %, DIS. %, CD %, or equivalent discount/cash-discount labels.
-  Set to 0 if no such column exists or the value is blank/zero.
-- `scheme_percentage`: map ONLY from a column explicitly labelled "Scheme%", "SCH%", "Scheme",
-  or similar. Set to null if absent.
+### R4: Identify the correct qty column — mandatory arithmetic gate
 
-These are independent fields. A scheme column must never be mapped to `discount_percentage`
-and a discount column must never be mapped to `scheme_percentage`. If both columns exist, extract both values separately. If only one exists, extract it and set the other to null/0.
+**qty** must be the quantity value where: **qty × rate = gross_amount** (within ₹1).
 
-### 6  `taxable_amount` — back-calculate from TAX AMT.
-  taxable_amount = line_total ÷ (1 + gst_rate / 100)
+Many invoices print multiple quantity columns (e.g., "No. of Boxes" and "Total Wt in Kg"). Only one of them will satisfy the arithmetic. The others are informational and must be ignored for qty.
 
-Cross-check: taxable_amount × (1 + gst_rate / 100) must equal line_total (within ₹0.02).
-If it doesn't match, re-read the row.
+Procedure — execute for every invoice:
+1. List every QUANTITY-type column identified in R2.
+2. Pick any one data row. For each quantity column, compute: candidate_value × rate.
+3. The column whose result matches gross_amount (within ₹1) → this is `qty`. Use its values for all rows.
+4. All other quantity columns → do not assign to qty. They have no schema field.
 
-Then compute:
-- Intra-State: cgst_amount = sgst_amount = round(taxable_amount × gst_rate / 2 / 100, 2); igst_amount = 0
-- Inter-State: igst_amount = round(taxable_amount × gst_rate / 100, 2); cgst_amount = sgst_amount = 0
-- cess_amount = 0 unless explicitly printed
+If no quantity column passes the test, the invoice may have no gross_amount column — in that case use the quantity column whose unit matches the unit stated in the rate column header (e.g., rate says "Per Kg" → use the Kg column).
 
-### 7  MANDATORY ROW COUNT GATE
+**HARD RULE:** Never assign qty from a column that fails qty × rate ≈ gross_amount, regardless of that column's label, position, or visual prominence.
 
-  **GATE 1 — Read PAGE_META first**
-  Record before touching the markdown:
-    EXPECTED_COUNT = item_count_this_page
-    EXPECTED_SNOS  = item_serial_numbers
-    FIRST_SNO      = first_sno_this_page
-    LAST_SNO       = last_sno_this_page
+### R5: Identify supplier and buyer GSTINs — read independently
 
-  **GATE 2 — Count rows before extracting**
-  Count rows where the first cell matches a number in EXPECTED_SNOS → MARKDOWN_COUNT.
-  Exclude: header row, B/F row, subtotal/total rows, blank rows.
-  If MARKDOWN_COUNT ≠ EXPECTED_COUNT → re-scan before proceeding.
+The invoice has two distinct party blocks: the seller/issuer (top-left or top section, "Goods Shipped From", signed party) and the bill-to/consignee (separate block, "Details of Recipient").
 
-  **GATE 3 — Extract row by row in S.No order**
-  Process FIRST_SNO to LAST_SNO in sequence.
-  - Row has no S.No but has ITEM NAME and TAX AMT → standalone item, assign next sequential sl_no.
-  - Row has no S.No and no TAX AMT → description continuation, append to previous item's description only.
-  - Rows containing "B/F", "Subtotal", "Total", "TOTAL ITEMS" → skip entirely.
+- **supplier_gstin**: read only from the seller/issuer block.
+- **buyer_gstin**: read only from the bill-to/consignee block.
 
-  **GATE 4 — Verify before outputting**
-  If len(line_items) ≠ EXPECTED_COUNT → re-scan from Gate 2. Do not output until they match.
+These are two different legal entities with different GSTINs. If both fields resolve to the same value, you have misread the invoice — re-read each block independently. Never copy one party's GSTIN into the other's field.
 
-### 8  Amounts
-- Plain JSON numbers only — no ₹, no commas, no quotes.
-- Indian number format: 1,253.42 → 1253.42
-- Preserve all decimal places exactly as printed.
+### R6: Supply type
+Compare first 2 digits of supplier_gstin and buyer_gstin:
+- Same → Intra-State
+- Different → Inter-State
+- Buyer GSTIN absent → default Intra-State
 
 ---
 
-## OUTPUT RULES
+## PHASE E — EXTRACT ROWS
 
-- Output **only the JSON object** — no explanation, no markdown fences, no preamble.
-- Strictly follow the provided PageLineItems JSON schema.
-- String fields not found: null. Number fields not found: 0.
-- Do not hallucinate values.
+### E0: Classify every row before extracting
+
+- **ITEM ROW**: has a serial number AND a product/service name AND at least one amount → extract.
+- **CONTINUATION ROW**: text in description column only, no serial/HSN/amount → append text to the immediately preceding item's description field. Do not create a new row.
+- **SKIP ROW**: contains B/F, C/F, Subtotal, Sub Total, Total, Grand Total, CGST/SGST/IGST Output, Less:, Add:, Rounded Off, R/off, TOTAL ITEMS, or any aggregate label → skip entirely, extract nothing.
+
+### E1: Identification fields
+
+| Field | What to extract | When to use null |
+|---|---|---|
+| sl_no | Printed serial number. If absent, assign next sequential integer. | — |
+| description | Product/service name exactly as printed. Append continuation row text. | — |
+| hsn | HSN code (goods) or SAC code (services). 4–8 alphanumeric characters from the HSN/SAC column only. | null if no HSN/SAC column exists |
+| batch | Batch or lot number from a dedicated batch/lot column only. | null if no batch column on this invoice |
+| expiry_date | From a dedicated expiry/best-before column. Print exactly as shown (e.g., "07/27", "Mar-26"). | null if no expiry column |
+| manufacturer | From a dedicated manufacturer/brand column only. | null if no such column |
+| packing_type | See definition below. | null if no packing column |
+| mrp | From a dedicated MRP column only. | null if no MRP column |
+
+**packing_type — definition:**
+packing_type describes how the product is packaged — it is a descriptor, not a billing quantity.
+It comes from a column explicitly labelled "Packing", "Pack Size", "Pack", "Pkt", or similar.
+Examples of packing_type values: "30 TABS", "12 KG/BAG", "1×12", "5 KG TIN", "500 ML BTL".
+packing_type is NEVER a qty value. It does not drive price. Do not confuse it with qty or unit.
+
+If an invoice shows "No. of Boxes = 3" and "Total Wt = 36 KG" and rate is Per Kg:
+- qty = 36, unit = KG (the value that satisfies qty × rate = gross)
+- packing_type = null unless a dedicated packing column exists separately
+- The "No. of Boxes" column has no schema field — ignore it.
+
+### E2: Quantity, unit, rate
+
+| Field | What to extract |
+|---|---|
+| qty | Value from the quantity column identified in R4 (the one satisfying qty × rate ≈ gross_amount). |
+| unit | Unit of that qty — from the passing column's header or its per-row unit cell. null if not stated anywhere. |
+| rate | Price per one unit of qty, before discount and before tax, from the RATE column. null if absent. |
+
+**unit — definition:**
+unit is the unit of measurement for qty. It comes from the qty column's header (e.g., "Qty (KG)" → unit = "KG") or from a dedicated per-row unit cell. It is never derived from packing_type or description.
+
+### E3: Amount fields
+
+Extract only fields that are present in the schema AND have a printed source on this invoice. Do not compute values that are not printed. Do not output a field if its column does not exist on this invoice.
+
+**gross_amount** *(output only if a GROSS_AMT column exists)*
+Copy from the GROSS_AMT column for this row.
+
+**discount_percentage** *(output only if a dedicated discount-% column exists)*
+Copy from a column labelled Disc%, CD%, Cash Disc%, Trade Disc%, or equivalent.
+This is a percentage figure (e.g., 4 means 4%).
+null if no such column exists on this invoice.
+NEVER fill from a scheme column, a free-qty column, or a footer note.
+
+**discount_amount** *(output only if a dedicated discount-amount column exists)*
+Copy from a column labelled Discount, Disc Amt, Less Disc, or equivalent.
+This is a rupee amount (e.g., 280.22).
+null if no such column exists on this invoice.
+NEVER compute from discount_percentage. NEVER fill from scheme or footer values.
+
+These two fields are fully independent. An invoice may have both, one, or neither.
+
+**taxable_amount** *(always required)*
+The pre-tax amount on which GST is calculated. Always less than or equal to gross_amount.
+Apply the first rule that fits:
+1. A TAXABLE_AMT column exists → copy its value directly.
+2. GROSS_AMT column + discount_amount both exist → copy taxable from invoice if printed; do not compute.
+3. Single amount column classified as GROSS_AMT or TAXABLE_AMT (no discount) → copy its value.
+4. Only a LINE_TOTAL column exists → do not attempt to extract taxable_amount; flag _warning.
+
+**gst_rate** *(required)*
+Total GST % for this line. From a per-row GST% column, or CGST% + SGST% columns summed, or the footer HSN-wise tax summary table.
+Express as a plain number without % sign (e.g., 5, 12, 18).
+null only if GST rate is genuinely not printed anywhere on this invoice.
+
+**line_total** *(output only if a LINE_TOTAL column exists OR the schema explicitly requires it)*
+Copy directly from the printed LINE_TOTAL column if it exists and is confirmed as post-tax (R3).
+Do NOT compute line_total from taxable + tax amounts.
+If no LINE_TOTAL column exists, omit this field entirely.
+
+**scheme%** *(output only if a dedicated scheme/bonus column exists)*
+From a column labelled Scheme%, SCH%, Bonus%, or equivalent — a promotional concession separate from the regular trade/cash discount.
+null if no such column exists.
+NEVER fill from a discount column, even if the discount column is zero.
+
+**free_qty** *(output only if a dedicated free-quantity column exists)*
+From a column labelled Free Qty, Free, Bonus Qty, or equivalent.
+This is a quantity of goods given at no charge. It is a count, not a percentage.
+null if no such column exists.
+NEVER copy a percentage value here.
+
+### E4: Sanity checks (do not block output; add _warning if a check fails)
+1. qty × rate ≈ gross_amount printed value (within ₹1). If fails: qty column may be wrong.
+2. gross_amount − discount_amount ≈ taxable_amount printed value (within ₹1). If fails: amount columns may be misclassified.
+3. If line_total is present: taxable_amount < line_total (line_total must exceed taxable when gst_rate > 0).
 
 ---
 
-## FINAL CHECKLIST — run before outputting
+## INVOICE HEADER
+Populate only when PAGE_META.bf_amount is null (first page). Set to null on all other pages.
+Fields: invoice_no, invoice_date (YYYY-MM-DD), payment_mode (null if absent), supplier_name, supplier_gstin, buyer_name, buyer_gstin, supply_type ("Intra-State" or "Inter-State").
 
-1. `page_audit.count_verified` is true — if not, re-extract.
-2. `page_audit.serial_match` is true — serial_numbers_extracted exactly equals PAGE_META.item_serial_numbers.
-3. Every line: taxable_amount × (1 + gst_rate/100) ≈ line_total (within ₹0.02).
-4. All amounts are plain numbers — no commas, no currency symbols.
-5. Every `expiry_date` is in YYYY-MM format.
-6. `page_audit.page_line_total` equals sum of all line_total values on this page.
-7. `invoice_header` non-null only if PAGE_META.bf_amount is null.
-8. `invoice_footer` non-null only if PAGE_META.has_grand_total is true.
-9. `grand_total` matches `amount_in_words` — if conflict, trust the words.
+---
+
+## INVOICE FOOTER
+Populate only when PAGE_META.has_grand_total is true. Set to null on all other pages.
+
+All footer values must be copied exactly as printed. Do not recompute any footer field.
+
+| Field | Source |
+|---|---|
+| taxable_value | Printed subtotal before GST |
+| total_igst | Printed IGST total; 0 if absent |
+| total_cgst | Printed CGST total; 0 if absent |
+| total_sgst | Printed SGST total; 0 if absent |
+| total_cess | Printed cess total; 0 if absent |
+| total_other_charges | Freight/insurance/packing charges included in total; 0 if absent |
+| rounding_off | Signed rounding adjustment as printed. Positive if labelled "Add". Negative if labelled "Less". 0 if absent. |
+| grand_total | Copy exactly as printed. Indian format: 1,23,456 = 123456. Cross-check against amount_in_words. If they conflict, trust the words and add _warning. |
+| amount_in_words | Exact text as printed. |
+
+transport fields (null if not printed): transporter, vehicle_no, lr_no, lr_date (YYYY-MM-DD), freight_terms (default "To Pay" if not stated), freight_amount (from LR document only; 0 if no LR freight amount is explicitly printed — never use the invoice grand total here).
+
+---
+
+## OTHER CHARGES
+If the invoice lists separately-charged items (freight, insurance, packing) as distinct rows with their own HSN/SAC code and amount, extract each into other_charges[]: description, hsn, amount, gst_rate.
+Do NOT create entries for tax summary rows, rounding-off rows, invoice total rows, or tax annotation rows.
+
+---
+
+## ROW COUNT GATE
+EXPECTED_COUNT = PAGE_META.item_count_this_page.
+Extract exactly that many ITEM ROWs. If count ≠ EXPECTED_COUNT after extraction, re-scan before outputting.
+
+---
+
+## GLOBAL RULES
+
+**Null vs 0 — strictly enforced:**
+- **null** = the column does not exist anywhere on this invoice. Use for: batch, expiry_date, manufacturer, packing_type, mrp, discount_percentage, discount_amount, scheme%, free_qty, unit, rate, hsn — when their dedicated column is absent.
+- **0** = the column exists on this invoice but this row's cell is empty or zero.
+- When in doubt between null and a guessed value: always output null.
+
+**Only extract what is printed:**
+- Never compute a field that has a dedicated printed column. Copy from the column.
+- Never fill a field by inferring from another field.
+- Never populate a field whose source column does not exist on this invoice.
+- If a value is illegible or ambiguous: null + _warning.
+
+**Numbers:** Strip ₹, Rs, commas, spaces. Indian format: 1,23,456.78 → 123456.78. Output as plain JSON numbers — no quotes, no symbols, no commas.
+
+**Field identity — each field maps to exactly one column:**
+- discount_percentage ≠ scheme% (different columns, different purposes)
+- discount_amount ≠ free_qty (one is rupees, the other is a count)
+- packing_type ≠ qty (packing_type describes packaging; qty drives billing)
+- batch ≠ hsn (batch is a lot identifier; hsn is a tax classification code)
+Never copy a value from one of these into another.
+
+---
+
+## FINAL CHECKLIST
+Before outputting, verify:
+1. Row count = PAGE_META.item_count_this_page. If not, re-scan.
+2. Serial numbers extracted match PAGE_META.item_serial_numbers exactly.
+3. Every row: qty × rate ≈ gross_amount (within ₹1). If any row fails, re-run R4.
+4. No field contains a value sourced from a column it does not represent.
+5. supplier_gstin ≠ buyer_gstin (they are different entities). If equal, re-read R5.
+6. All absent nullable fields are null, not 0, not empty string.
+7. grand_total matches amount_in_words. If conflict, trust words and add _warning.
+8. invoice_header is non-null only when PAGE_META.bf_amount = null.
+9. invoice_footer is non-null only when PAGE_META.has_grand_total = true.
+10. No field value was invented, computed, or inferred without a printed source.
 """
 
 def _invoice_header_schema():
@@ -433,54 +554,9 @@ def _page_audit_schema():
     }
 
 
-def get_invoice_data_schema(expected_line_item_count=None, medical_invoice=False, page_mode=False):
+def get_invoice_data_schema(expected_line_item_count=None, page_mode=False):
     schema = deepcopy(INVOICE_DATA_SCHEMA)
-    line_item_schema = schema["properties"]["line_items"]["items"]
-
-    if medical_invoice:
-        line_item_schema["properties"].update(
-            {
-                "expiry_date": {
-                    "type": ["string", "null"],
-                    "description": "Medicine expiry date exactly as printed, e.g. MM/YY, MM/YYYY, or YYYY-MM-DD.",
-                },
-                "batch": {
-                    "type": ["string", "null"],
-                    "description": "Medicine batch number exactly as printed.",
-                },
-                "manufacturer": {
-                    "type": ["string", "null"],
-                    "description": "Medicine manufacturer name exactly as printed.",
-                },
-                "packing_type": {
-                    "type": ["string", "null"],
-                    "description": "Packing type/pack size exactly as printed, often the number of units in one pack.",
-                },
-                "scheme%": {
-                    "type": ["string", "number", "null"],
-                    "description": "Medicine scheme/bonus percentage exactly as printed only from a separate Scheme/Sch/Bonus column; otherwise null. Never copy discount percentage here.",
-                },
-                "free_qty": {
-                    "type": ["string", "number", "null"],
-                    "description": "Free/bonus quantity exactly as printed only from a separate Free/Bonus quantity column; otherwise null. Never copy discount percentage here.",
-                },
-                "mrp": {
-                    "type": ["string", "number", "null"],
-                    "description": "Maximum retail price of the item as printed."
-                }
-            }
-        )
-        line_item_schema["required"] = [
-            *line_item_schema["required"],
-            "expiry_date",
-            "batch",
-            "scheme%",
-            "free_qty",
-            "manufacturer",
-            "packing_type",
-            "mrp"
-        ]
-
+    
     if page_mode:
         schema["description"] = "Schema for one parsed invoice page. The backend will merge page JSON objects."
         schema["required"] = [
@@ -519,7 +595,7 @@ def get_invoice_data_schema(expected_line_item_count=None, medical_invoice=False
     return schema
 
 
-def get_invoice_system_prompt(expected_line_item_count=None, medical_invoice=False, page_mode=False):
+def get_invoice_system_prompt(expected_line_item_count=None, page_mode=False):
     extra_instructions = []
 
     if page_mode:
@@ -532,24 +608,6 @@ Return one page JSON object for the current PAGE_META only.
 - `line_items`: must contain exactly PAGE_META.item_count_this_page rows when has_item_table is true.
 - `page_audit.extracted_count` must equal len(line_items).
 - Do not return a full merged invoice here. The backend will merge page JSON objects.
-"""
-        )
-
-    if medical_invoice:
-        extra_instructions.append(
-            """
-### Medical invoice line item fields
-The user has marked this as a medical/pharma invoice.
-- For every `line_items` entry, also extract the following fields:
-  - `expiry_date`: Medicine expiry exactly as printed. Look under columns labeled "EXP", "EXPIRY", or similar variants.
-  - `batch`: Batch/lot number exactly as printed.
-  - `scheme%`: Scheme/bonus percentage exactly as printed only from a separate Scheme/Sch/Bonus column; otherwise null. Never copy discount percentage here.
-  - `free_qty`: Free/bonus quantity exactly as printed only from a separate Free/Bonus quantity column; otherwise null. Never copy discount percentage here.
-  - `mrp`: Maximum retail price exactly as printed, if present.
-  - `manufacturer`: Medicine manufacturer exactly as printed. Look under columns labeled "MFG", "MANUFACTURER", or similar variants.
-  - `packing_type`: Pack size or type exactly as printed (often the count of units per pack). Look under columns labeled "PACK", "PACKING", or similar variants.
-- Set any genuinely absent field to `null`. Do not guess or infer missing values.
-- Do not normalize, convert, or reformat values — trim leading/trailing whitespace only.
 """
         )
 
@@ -914,7 +972,7 @@ Output a JSON object with exactly these fields:
   \"item_count_this_page\": <integer — count of data rows on THIS page only, excludes B/F row, headers, subtotals, grand total>,
   \"first_sno_this_page\": <integer or null — the S.No of the first item row on this page>,
   \"last_sno_this_page\": <integer or null — the S.No of the last item row on this page>,
-  \"has_grand_total\": <true|false — true if this page contains the final TOTAL ITEMS / Grand Total footer>,
+  \"has_grand_total\": <true|false — true if this page contains the final TOTAL ITEMS / Grand Total row of the invoice including the final amount, else false>,
   \"printed_total_items\": <integer or null — the number printed next to 'TOTAL ITEMS :' if present on this page, else null>,
   \"page_subtotal_amount\": <number or null — the subtotal or B/C amount printed at the bottom of this page's item table, null if absent>
 }

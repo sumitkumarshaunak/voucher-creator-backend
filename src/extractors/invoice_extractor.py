@@ -251,7 +251,6 @@ def _extract_invoice_json(
     text,
     api_key=None,
     expected_line_item_count=None,
-    medical_invoice=False,
     page_mode=False,
 ):
     source_text = markdown or text
@@ -260,12 +259,10 @@ def _extract_invoice_json(
 
     system_prompt = get_invoice_system_prompt(
         expected_line_item_count,
-        medical_invoice=medical_invoice,
         page_mode=page_mode,
     )
     data_schema = get_invoice_data_schema(
         expected_line_item_count,
-        medical_invoice=medical_invoice,
         page_mode=page_mode,
     )
 
@@ -396,7 +393,7 @@ def _validate_page_result(page, result):
         )
 
 
-def _extract_invoice_page_result(page, api_key=None, medical_invoice=False):
+def _extract_invoice_page_result(page, api_key=None):
     page_number = (page.get("meta") or {}).get("page_number") or "unknown"
     try:
         page_result = _extract_invoice_json(
@@ -404,7 +401,6 @@ def _extract_invoice_page_result(page, api_key=None, medical_invoice=False):
             "",
             api_key=api_key,
             expected_line_item_count=None,
-            medical_invoice=medical_invoice,
             page_mode=True,
         )
         normalized_page_result = _unwrap_schema_shaped_result(page_result)
@@ -419,13 +415,13 @@ def _extract_invoice_page_result(page, api_key=None, medical_invoice=False):
         raise RuntimeError(f"LLM invoice extraction failed for page {page_number}.") from error
 
 
-def _extract_invoice_from_pages(pages, api_key=None, expected_line_item_count=None, medical_invoice=False):
+def _extract_invoice_from_pages(pages, api_key=None, expected_line_item_count=None):
     sorted_pages = sorted(pages, key=lambda page: (page.get("meta") or {}).get("page_number") or 0)
     page_outputs_by_number = {}
 
     with ThreadPoolExecutor(max_workers=_worker_count(len(sorted_pages), INVOICE_LLM_MAX_WORKERS)) as executor:
         futures = {
-            executor.submit(_extract_invoice_page_result, page, api_key, medical_invoice): (
+            executor.submit(_extract_invoice_page_result, page, api_key): (
                 page.get("meta") or {}
             ).get("page_number")
             for page in sorted_pages
@@ -463,7 +459,6 @@ def extract_file(file_path, document_type=None, api_key=None, openai_api_key=Non
 
     row_options = row_options or {}
     expected_line_item_count = row_options.get("expected_line_item_count")
-    medical_invoice = bool(row_options.get("medical_invoice"))
 
     _reset_page_json_debug_file()
     parsed = None
@@ -487,7 +482,6 @@ def extract_file(file_path, document_type=None, api_key=None, openai_api_key=Non
             pages,
             api_key=openai_api_key,
             expected_line_item_count=expected_line_item_count,
-            medical_invoice=medical_invoice,
         )
     else:
         if parsed is None:
@@ -497,7 +491,6 @@ def extract_file(file_path, document_type=None, api_key=None, openai_api_key=Non
             parsed["text"],
             api_key=openai_api_key,
             expected_line_item_count=expected_line_item_count,
-            medical_invoice=medical_invoice,
         ))
         page_metadata = {"page_llm_calls": 0, "page_meta": []}
 
@@ -510,7 +503,6 @@ def extract_file(file_path, document_type=None, api_key=None, openai_api_key=Non
             "json_model": INVOICE_JSON_MODEL,
             "source_file_count": 1,
             "expected_line_item_count": expected_line_item_count,
-            "medical_invoice": medical_invoice,
             **page_metadata,
         },
     }
@@ -539,7 +531,6 @@ def extract_files(file_paths, document_type=None, api_key=None, openai_api_key=N
 
     row_options = row_options or {}
     expected_line_item_count = row_options.get("expected_line_item_count")
-    medical_invoice = bool(row_options.get("medical_invoice"))
 
     _reset_page_json_debug_file()
     pages = _markdown_pages_from_image_files(file_paths, api_key=api_key)
@@ -557,7 +548,6 @@ def extract_files(file_paths, document_type=None, api_key=None, openai_api_key=N
         pages,
         api_key=openai_api_key,
         expected_line_item_count=expected_line_item_count,
-        medical_invoice=medical_invoice,
     )
 
     return {
@@ -569,7 +559,6 @@ def extract_files(file_paths, document_type=None, api_key=None, openai_api_key=N
             "json_model": INVOICE_JSON_MODEL,
             "source_file_count": len(file_paths),
             "expected_line_item_count": expected_line_item_count,
-            "medical_invoice": medical_invoice,
             **page_metadata,
         },
     }

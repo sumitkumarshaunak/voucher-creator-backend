@@ -138,8 +138,7 @@ curl -X POST http://127.0.0.1:8000/extract \
   -F "file=@/path/to/invoice.pdf" \
   -F "document_type=invoice" \
   -F "source=sales-invoice" \
-  -F "expected_line_item_count=12" \
-  -F "medical_invoice=true"
+  -F "expected_line_item_count=12"
 ```
 
 ### Sales Report

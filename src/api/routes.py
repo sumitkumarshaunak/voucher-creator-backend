@@ -118,7 +118,6 @@ async def extract(request: Request, background_tasks: BackgroundTasks):
     row_from = _optional_form_int(form, "row_from")
     row_to = _optional_form_int(form, "row_to")
     expected_line_item_count = _optional_form_int(form, "expected_line_item_count")
-    medical_invoice = _optional_form_bool(form, "medical_invoice")
     header_mappings = _optional_form_str(form, "header_mappings")
     client_file_count = _optional_form_int(form, "client_file_count")
 
@@ -149,7 +148,6 @@ async def extract(request: Request, background_tasks: BackgroundTasks):
         row_from,
         row_to,
         expected_line_item_count,
-        medical_invoice,
         header_mappings,
     )
 
@@ -229,7 +227,6 @@ def _extract_options(
     row_from,
     row_to,
     expected_line_item_count=None,
-    medical_invoice=False,
     header_mappings=None,
 ):
     options = {
@@ -237,12 +234,9 @@ def _extract_options(
         "row_from": row_from,
         "row_to": row_to,
         "expected_line_item_count": expected_line_item_count,
-        "medical_invoice": medical_invoice,
     }
 
     for label, value in options.items():
-        if isinstance(value, bool):
-            continue
         if value is not None and value < 1:
             raise HTTPException(status_code=400, detail=f"{label} must be greater than zero.")
 
